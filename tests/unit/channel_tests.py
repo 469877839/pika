@@ -2,14 +2,16 @@
 
 import collections
 import contextlib
+import heapq
 import logging
 import sys
 import unittest
 import warnings
-from typing import cast
+from typing import Callable, cast
 from unittest import mock
 
 from pika import callback, channel, connection, exceptions, frame, spec
+from pika.adapters import select_connection
 
 
 class ConnectionTemplate(connection.Connection):
@@ -2028,7 +2030,7 @@ class ChannelTests(unittest.TestCase):
         mock_callback = mock.Mock()
         expectation = [
             spec.Queue.Unbind(0, 'foo', 'bar', 'baz'), mock_callback,
-            [spec.Queue.UnbindOk]
+            [spec.Queue.UnbindOk], None
         ]
         self.obj._blocked = collections.deque([expectation])
         self.obj._on_synchronous_complete(
@@ -2050,7 +2052,8 @@ class ChannelTests(unittest.TestCase):
             'consumer_tag': 'tag_abc'
         })]
         expectation = [
-            spec.Basic.Cancel('tag_abc'), lambda *args: None, acceptable_replies
+            spec.Basic.Cancel('tag_abc'), lambda *args: None, acceptable_replies,
+            None
         ]
         self.obj._rpc(*expectation)
         self.assertIn(expectation, self.obj._blocked)
@@ -2132,3 +2135,299 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual(send_method_mock.call_count, 1)
         self.assertIsNone(self.obj._blocking)
         self.assertEqual(cb_add_mock.call_count, 0)
+
+
+class _FakeClock:
+    """Deterministic timer backend replacing the connection's I/O loop timers.
+
+    Timers only fire when a test calls `advance`, so the ordering of an RPC deadline relative to
+    the broker's reply is under explicit control. Handles returned by `call_later` are the same
+    `_Timeout` objects the real `Timer` uses, and `remove_timeout` deactivates them the same way.
+    """
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self._timers: list[select_connection._Timeout] = []
+
+    def call_later(self, delay: float,
+                   callback: Callable) -> select_connection._Timeout:
+        timeout = select_connection._Timeout(self.now + delay, callback)
+        heapq.heappush(self._timers, timeout)
+        return timeout
+
+    def remove_timeout(self, timeout: select_connection._Timeout) -> None:
+        timeout.callback = None
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+        while self._timers and self._timers[0].deadline <= self.now:
+            timeout = heapq.heappop(self._timers)
+            if timeout.callback is not None:
+                timeout.callback()
+
+
+class RpcDeadlineTests(unittest.TestCase):
+    """Single-shot RPC deadlines, driven by a fake clock.
+
+    AMQP 0.9.1 replies carry no request id, so a reply that arrives after its RPC's deadline cannot
+    be told apart from the reply to an identical RPC issued later. Between the two choices - keep
+    accepting replies and risk matching a straggler to a later call, or flush everything and refuse
+    further synchronous RPCs - the channel does the latter. These tests use a fake clock to place
+    replies on either side of the deadline and assert which call completes, which fails, and what
+    can still be sent.
+    """
+
+    def setUp(self):
+        self.connection = ChannelTests._create_connection()
+        self.connection.accept_consumer_cancel_ok = False
+        self.connection.callbacks = callback.CallbackManager()
+        # The reply frames are processed through the same CallbackManager the
+        # connection uses for inbound frames; only the timer needs faking.
+        self.clock = _FakeClock()
+        self.connection._adapter_call_later.side_effect = self.clock.call_later
+        self.connection._adapter_remove_timeout.side_effect = (
+            self.clock.remove_timeout)
+        self.chan = channel.Channel(self.connection, 1, lambda _ch: None)
+        self.chan._set_state(self.chan.OPEN)
+
+    def _process(self, method):
+        """Deliver a reply method frame as the connection would."""
+        reply = frame.Method(self.chan.channel_number, method)
+        self.connection.callbacks.process(self.chan.channel_number, method,
+                                          self.connection, reply)
+        return reply
+
+    def _sent_methods(self):
+        return [
+            call[0][1].NAME
+            for call in self.connection._send_method.call_args_list
+        ]
+
+    def test_late_reply_is_not_matched_to_a_later_identical_rpc(self):
+        first = mock.Mock()
+        queued_identical = mock.Mock()
+        queued_different = mock.Mock()
+
+        # Three requests: the first goes out, the other two queue behind it.
+        self.chan.queue_declare('q', callback=first, deadline=5)
+        self.chan.queue_declare('q', callback=queued_identical, deadline=5)
+        self.chan.queue_purge('q', callback=queued_different)
+
+        self.assertEqual(self._sent_methods(), ['Queue.Declare'])
+        self.assertEqual(
+            self.connection.callbacks.pending(self.chan.channel_number,
+                                              spec.Queue.DeclareOk), 2)
+
+        # The deadline expires before any reply arrives.
+        self.clock.advance(5)
+        first.assert_not_called()
+        queued_identical.assert_not_called()
+        queued_different.assert_not_called()
+        self.assertIsInstance(self.chan._rpc_expiry_error,
+                              exceptions.ChannelRpcTimeout)
+
+        # The queued requests were dropped without ever being sent, so no
+        # further timer was armed for either of them.
+        self.assertEqual(self._sent_methods(), ['Queue.Declare'])
+        self.assertIsNone(self.chan._blocking)
+
+        # Every reply the three requests could have produced now arrives. The
+        # callbacks for all of them are detached, so no call completes: this
+        # is not achieved by ignoring every frame, but by having nothing left
+        # for these particular replies to match.
+        self._process(spec.Queue.DeclareOk(queue='q'))
+        self._process(spec.Queue.DeclareOk(queue='q'))
+        self._process(spec.Queue.PurgeOk(0))
+        first.assert_not_called()
+        queued_identical.assert_not_called()
+        queued_different.assert_not_called()
+        self.assertEqual(self._sent_methods(), ['Queue.Declare'])
+
+        # Neither the same RPC nor a different one can be issued: the overdue
+        # reply is of a type both could match.
+        for issue in (lambda cb: self.chan.queue_declare('q', callback=cb),
+                      lambda cb: self.chan.queue_declare('other',
+                                                         callback=cb),
+                      lambda cb: self.chan.queue_purge('q', callback=cb)):
+            with self.assertRaises(exceptions.ChannelRpcTimeout):
+                issue(mock.Mock())
+        self.assertEqual(self._sent_methods(), ['Queue.Declare'])
+
+        # Fire-and-forget methods expect no reply, so they remain usable.
+        self.chan.basic_ack(7)
+        self.chan.basic_nack(8, requeue=False)
+        self.assertEqual(self._sent_methods(),
+                         ['Queue.Declare', 'Basic.Ack', 'Basic.Nack'])
+
+    def test_close_after_an_expiry_meta_closes_without_sending_channel_close(
+            self):
+        expired = mock.Mock()
+        self.chan.queue_declare('q', callback=expired, deadline=5)
+        self.clock.advance(5)
+        expired.assert_not_called()
+
+        on_close = mock.Mock()
+        self.chan.add_on_close_callback(on_close)
+        self.chan.close()
+
+        # A Channel.Close could be answered by the overdue reply, so it is not
+        # sent; the channel is torn down locally instead.
+        self.assertEqual(self._sent_methods(), ['Queue.Declare'])
+        self.assertTrue(self.chan.is_closed)
+        reason = on_close.call_args[0][1]
+        self.assertIsInstance(reason, exceptions.ChannelRpcTimeout)
+
+    def test_reply_before_the_deadline_cancels_the_timer_and_later_rpcs_work(
+            self):
+        first = mock.Mock()
+        second = mock.Mock()
+        self.chan.queue_declare('q', callback=first, deadline=5)
+        reply_1 = self._process(spec.Queue.DeclareOk(queue='q'))
+        first.assert_called_once_with(reply_1)
+        self.assertIsNone(self.chan._rpc_expiry_error)
+
+        # Advancing past the (now cancelled) deadline must not poison the
+        # channel.
+        self.clock.advance(10)
+        self.assertIsNone(self.chan._rpc_expiry_error)
+
+        self.chan.queue_declare('q', callback=second)
+        reply_2 = self._process(spec.Queue.DeclareOk(queue='q'))
+        second.assert_called_once_with(reply_2)
+
+    def test_reply_read_at_the_deadline_instant_cancels_the_timer(self):
+        done = mock.Mock()
+        self.chan.queue_declare('q', callback=done, deadline=5)
+
+        # Model a poll where the reply frame and the expired timer are both
+        # ready: the reply is processed first.
+        reply = self._process(spec.Queue.DeclareOk(queue='q'))
+        done.assert_called_once_with(reply)
+        self.clock.advance(5)
+
+        self.assertIsNone(self.chan._rpc_expiry_error)
+        self.assertIsNone(self.chan._rpc_timer)
+
+    def test_deadline_armed_only_when_the_request_is_sent(self):
+        blocking = mock.Mock()
+        queued = mock.Mock()
+        self.chan.queue_declare('q', callback=blocking)
+        self.chan.queue_purge('q', callback=queued, deadline=2)
+        self.assertEqual(self._sent_methods(), ['Queue.Declare'])
+
+        # The queued request has not been sent, so its deadline cannot expire
+        # and must not poison the channel.
+        self.clock.advance(100)
+        self.assertIsNone(self.chan._rpc_expiry_error)
+        self.assertIsNone(self.chan._rpc_timer)
+
+        # Once the blocking request's reply arrives, the queued one is sent and
+        # only then gets its own timer, starting from that moment.
+        self._process(spec.Queue.DeclareOk(queue='q'))
+        self.assertEqual(self._sent_methods(), ['Queue.Declare', 'Queue.Purge'])
+        self.assertEqual(self.chan._rpc_deadline, 2)
+
+        self.clock.advance(2)
+        self.assertIsInstance(self.chan._rpc_expiry_error,
+                              exceptions.ChannelRpcTimeout)
+
+    def test_a_stale_timer_callback_cannot_kill_a_later_rpc(self):
+        first = mock.Mock()
+        second = mock.Mock()
+        self.chan.queue_declare('q', callback=first, deadline=5)
+        stale_callback = self.clock._timers[0].callback
+
+        # The first reply wins; its timer is deactivated. Then a second RPC
+        # arms its own timer.
+        self._process(spec.Queue.DeclareOk(queue='q'))
+        first.assert_called_once()
+        self.chan.queue_purge('q', callback=second, deadline=10)
+
+        # An adapter that still had the first callback queued fires it late.
+        # It belongs to a dead timer, so it must leave the current RPC alone.
+        stale_callback()
+
+        self.assertIsNone(self.chan._rpc_expiry_error)
+        self.assertIsNotNone(self.chan._rpc_timer)
+        second.assert_not_called()
+
+        # The second RPC still completes on its own reply.
+        self._process(spec.Queue.PurgeOk(0))
+        second.assert_called_once()
+
+    def test_no_deadline_never_expires(self):
+        still_waiting = mock.Mock()
+        self.chan.queue_declare('q', callback=still_waiting)
+        self.clock.advance(10**6)
+        self.assertIsNone(self.chan._rpc_expiry_error)
+        self.assertIsNone(self.chan._rpc_timer)
+        still_waiting.assert_not_called()
+
+        reply = self._process(spec.Queue.DeclareOk(queue='q'))
+        still_waiting.assert_called_once_with(reply)
+
+    def test_expiry_detaches_all_of_the_expired_rpc_callbacks(self):
+        callback_mock = mock.Mock()
+        self.chan.queue_declare('q', callback=callback_mock, deadline=5)
+        self.assertEqual(
+            self.connection.callbacks.pending(self.chan.channel_number,
+                                              spec.Queue.DeclareOk), 2)
+
+        self.clock.advance(5)
+
+        # Both the internal unblocking callback and the user callback are
+        # gone, so a straggler cannot complete this or a later request.
+        self.assertIsNone(
+            self.connection.callbacks.pending(self.chan.channel_number,
+                                              spec.Queue.DeclareOk))
+        callback_mock.assert_not_called()
+
+    def test_expiry_notifies_wrappers_and_the_callback_can_be_removed(self):
+        notified = mock.Mock()
+        self.chan.add_on_rpc_timeout_callback(notified)
+        self.chan.queue_declare('q', callback=mock.Mock(), deadline=5)
+        self.clock.advance(5)
+
+        notified.assert_called_once_with(self.chan, self.chan._rpc_expiry_error)
+        self.assertTrue(
+            self.chan.remove_on_rpc_timeout_callback(notified))
+        self.assertFalse(
+            self.chan.remove_on_rpc_timeout_callback(notified))
+
+    def test_channel_cleanup_cancels_an_armed_deadline(self):
+        armed = mock.Mock()
+        self.chan.queue_declare('q', callback=armed, deadline=5)
+        self.assertIsNotNone(self.chan._rpc_timer)
+
+        # Sudden connection loss meta-closes the channel while the timer is
+        # still armed.
+        self.chan._on_close_meta(exceptions.StreamLostError('gone'))
+        self.assertIsNone(self.chan._rpc_timer)
+
+        self.clock.advance(5)
+        armed.assert_not_called()
+        self.assertIsNone(self.chan._rpc_expiry_error)
+
+    def test_deadline_requires_a_reply(self):
+        with self.assertRaises(ValueError):
+            self.chan.queue_delete('q', deadline=1)
+        with self.assertRaises(ValueError):
+            self.chan.confirm_delivery(ack_nack_callback=mock.Mock(),
+                                       deadline=1)
+
+    def test_deadline_must_be_none_or_a_non_negative_number(self):
+        for bad in (-1, -0.5, 'soon', True, object()):
+            with self.assertRaises(TypeError):
+                self.chan.queue_declare('q',
+                                        callback=mock.Mock(),
+                                        deadline=bad)
+        self.chan.queue_declare('q', callback=mock.Mock(), deadline=0)
+        self.assertEqual(self.chan._rpc_deadline, 0)
+
+    def test_expiry_error_is_the_same_object_on_every_later_refusal(self):
+        self.chan.queue_declare('q', callback=mock.Mock(), deadline=5)
+        self.clock.advance(5)
+        for _ in range(2):
+            with self.assertRaises(exceptions.ChannelRpcTimeout) as ctx:
+                self.chan.queue_purge('q', callback=mock.Mock())
+            self.assertIs(ctx.exception, self.chan._rpc_expiry_error)

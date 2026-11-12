@@ -1346,6 +1346,10 @@ class BlockingChannel:
         # self._on_channel_closed() saves the reason exception here
         self._closing_reason = None  # type: None | Exception
 
+        # Set by `_on_rpc_timeout` when the impl's per-RPC deadline fires; the
+        # next `_flush_output` raises it instead of continuing to wait.
+        self._rpc_timeout_error = None  # type: None | exceptions.ChannelRpcTimeout
+
         # Receives Basic.ConsumeOk reply from server
         self._basic_consume_ok_result: _CallbackResult[None] = _CallbackResult()
 
@@ -1361,6 +1365,8 @@ class BlockingChannel:
                                 one_shot=False)
 
         self._impl.add_on_close_callback(self._on_channel_closed)
+
+        self._impl.add_on_rpc_timeout_callback(self._on_rpc_timeout)
 
         self._impl.add_callback(self._basic_getempty_result.set_value_once,
                                 replies=[pika.spec.Basic.GetEmpty],
@@ -1427,9 +1433,10 @@ class BlockingChannel:
     def _flush_output(self, *waiters: Callable[[], bool]) -> None:
         """
         Flush output and process input while waiting for any of the given callbacks to return true.
-        The wait is aborted upon channel-close or connection-close. Otherwise, processing continues
-        until the output is flushed AND at least one of the callbacks returns true. If there are no
-        callbacks, then processing ends when all output is flushed.
+        The wait is aborted upon channel-close, connection-close or an RPC deadline expiring.
+        Otherwise, processing continues until the output is flushed AND at least one of the
+        callbacks returns true. If there are no callbacks, then processing ends when all output is
+        flushed.
 
         :param waiters: sequence of zero or more callables taking no args and returning true when
             it's time to stop processing. Their results are OR'ed together. An empty sequence is
@@ -1441,7 +1448,12 @@ class BlockingChannel:
         if not waiters:
             waiters = self._ALWAYS_READY_WAITERS
 
-        self._connection._flush_output(lambda: self.is_closed, *waiters)
+        self._connection._flush_output(lambda: self.is_closed,
+                                       lambda: self._rpc_timeout_error
+                                       is not None, *waiters)
+
+        if self._rpc_timeout_error is not None:
+            raise self._rpc_timeout_error
 
         if self.is_closed and isinstance(self._closing_reason,
                                          exceptions.ChannelClosedByBroker):
@@ -1522,6 +1534,22 @@ class BlockingChannel:
             # Request urgent termination of `process_data_events()`, in case
             # it's executing or next time it will execute
             self.connection._request_channel_dispatch(-self.channel_number)
+
+    def _on_rpc_timeout(
+            self, _channel: pika.channel.Channel,
+            error: exceptions.ChannelRpcTimeout) -> None:
+        """
+        Receive the impl's per-RPC deadline expiry and wake the blocking wait that owns the RPC.
+
+        The impl stays open for fire-and-forget frames, but `_flush_output` raises *error* once the
+        wait loop observes it. Like `_on_channel_closed`, this must not raise into the I/O loop.
+
+        :param _channel: (unused)
+        :param error: The `ChannelRpcTimeout` describing the expiry
+        """
+        LOGGER.debug('_on_rpc_timeout: %r; %r', error, self)
+        self._rpc_timeout_error = error
+        self.connection._request_channel_dispatch(-self.channel_number)
 
     def _on_consumer_cancelled_by_broker(
             self,
@@ -1636,16 +1664,25 @@ class BlockingChannel:
         self._impl._raise_if_not_open()
 
         try:
-            # Cancel remaining consumers
-            self._cancel_all_consumers()
+            # Cancel remaining consumers unless an RPC already expired: the
+            # impl would then refuse the cancel RPC, and its close() meta-closes
+            # locally instead of putting Channel.Close on the wire.
+            if self._rpc_timeout_error is None:
+                self._cancel_all_consumers()
 
             # Close the channel
             self._impl.close(reply_code=reply_code, reply_text=reply_text)
-            self._flush_output(lambda: self.is_closed)
+            try:
+                self._flush_output(lambda: self.is_closed)
+            except exceptions.ChannelRpcTimeout:
+                # The impl's meta-close after an earlier expiry transitions
+                # the channel synchronously; the waiter raised from that
+                # same expiry, which is the intended end of this close.
+                pass
         finally:
             self._cleanup()
 
-    def flow(self, active: bool) -> bool:
+    def flow(self, active: bool, deadline: float | None = None) -> bool:
         """
         Turn Channel flow control off and on.
 
@@ -1659,11 +1696,15 @@ class BlockingChannel:
         https://www.rabbitmq.com/amqp-0-9-1-reference.html#channel.flow
 
         :param active: Turn flow on (True) or off (False)
+        :param deadline: Seconds to wait for Channel.FlowOk, or None (the default) to wait
+            indefinitely; see `pika.channel.Channel.flow`.
         :returns: True if broker will start or continue sending; False if not
+        :raises pika.exceptions.ChannelRpcTimeout: if *deadline* expires
         """
         with _CallbackResult(self._FlowOkCallbackResultArgs) as flow_ok_result:
             self._impl.flow(active=active,
-                            callback=flow_ok_result.set_value_once)
+                            callback=flow_ok_result.set_value_once,
+                            deadline=deadline)
             self._flush_output(flow_ok_result.is_ready)
             return flow_ok_result.value.active
 
@@ -1716,7 +1757,8 @@ class BlockingChannel:
                       auto_ack: bool = False,
                       exclusive: bool = False,
                       consumer_tag: str | None = None,
-                      arguments: dict[str, Any] | None = None) -> str:
+                      arguments: dict[str, Any] | None = None,
+                      deadline: float | None = None) -> str:
         """
         Sends the AMQP command Basic.Consume to the broker and binds messages for the consumer_tag
         to the consumer callback. If you do not pass in a consumer_tag, one will be automatically
@@ -1746,9 +1788,12 @@ class BlockingChannel:
         :param consumer_tag: You may specify your own consumer tag; if left
           empty, a consumer tag will be generated automatically
         :param arguments: Custom key/value pair arguments for the consumer
+        :param deadline: Seconds to wait for Basic.ConsumeOk, or None (the default) to wait
+            indefinitely; see `pika.channel.Channel.basic_consume`.
         :returns: consumer tag
         :raises pika.exceptions.DuplicateConsumerTag: if consumer with given
             consumer_tag is already present.
+        :raises pika.exceptions.ChannelRpcTimeout: if *deadline* expires
         """
         validators.require_string(queue, 'queue')
         validators.require_callback(on_message_callback, 'on_message_callback')
@@ -1757,7 +1802,8 @@ class BlockingChannel:
                                         auto_ack=auto_ack,
                                         exclusive=exclusive,
                                         consumer_tag=consumer_tag,
-                                        arguments=arguments)
+                                        arguments=arguments,
+                                        deadline=deadline)
 
     def _basic_consume_impl(
         self,
@@ -1770,7 +1816,8 @@ class BlockingChannel:
             BlockingChannel, pika.spec.Basic.Deliver, pika.spec.
             BasicProperties, bytes
         ], None] | None = None,
-        alternate_event_sink: Callable[[_ChannelPendingEvt], None] | None = None
+        alternate_event_sink: Callable[[_ChannelPendingEvt], None] | None = None,
+        deadline: float | None = None
     ) -> str:
         """
         The low-level implementation used by `basic_consume` and `consume`.
@@ -1828,7 +1875,8 @@ class BlockingChannel:
                     auto_ack=auto_ack,
                     exclusive=exclusive,
                     consumer_tag=consumer_tag,
-                    arguments=arguments)
+                    arguments=arguments,
+                    deadline=deadline)
 
                 assert tag == consumer_tag, (tag, consumer_tag)
 
@@ -1850,7 +1898,7 @@ class BlockingChannel:
         return consumer_tag
 
     def basic_cancel(
-        self, consumer_tag: str
+        self, consumer_tag: str, *, deadline: float | None = None
     ) -> Sequence[tuple[pika.spec.Basic.Deliver, pika.spec.BasicProperties,
                         bytes]]:
         """
@@ -1880,6 +1928,9 @@ class BlockingChannel:
             - method: spec.Basic.Deliver
             - properties: spec.BasicProperties
             - body: bytes
+        :param deadline: Seconds to wait for Basic.CancelOk, or None (the default) to wait
+            indefinitely; see `pika.channel.Channel.basic_cancel`.
+        :raises pika.exceptions.ChannelRpcTimeout: if *deadline* expires
         """
         try:
             consumer_info = self._consumer_infos[consumer_tag]
@@ -1929,7 +1980,8 @@ class BlockingChannel:
                 if consumer_tag in self._impl._consumers:
                     self._impl.basic_cancel(
                         consumer_tag=consumer_tag,
-                        callback=cancel_ok_result.signal_once)
+                        callback=cancel_ok_result.signal_once,
+                        deadline=deadline)
                     waiters = (
                         cancel_ok_result.is_ready,
                         lambda: consumer_tag not in self._impl._consumers)
@@ -2434,7 +2486,8 @@ class BlockingChannel:
     def basic_qos(self,
                   prefetch_size: int = 0,
                   prefetch_count: int = 0,
-                  global_qos: bool = False) -> None:
+                  global_qos: bool = False,
+                  deadline: float | None = None) -> None:
         """
         Specify quality of service.
 
@@ -2454,15 +2507,21 @@ class BlockingChannel:
             advance if both prefetch windows (and those at the channel and connection level) allow
             it. The prefetch-count is ignored if the no-ack option is set in the consumer.
         :param global_qos: Should the QoS apply to all channels on the connection.
+        :param deadline: Seconds to wait for Basic.QosOk, or None (the default) to wait
+            indefinitely; see `pika.channel.Channel.basic_qos`.
+        :raises pika.exceptions.ChannelRpcTimeout: if *deadline* expires
         """
         with _CallbackResult[None]() as qos_ok_result:
             self._impl.basic_qos(callback=qos_ok_result.signal_once,
                                  prefetch_size=prefetch_size,
                                  prefetch_count=prefetch_count,
-                                 global_qos=global_qos)
+                                 global_qos=global_qos,
+                                 deadline=deadline)
             self._flush_output(qos_ok_result.is_ready)
 
-    def basic_recover(self, requeue: bool = False) -> None:
+    def basic_recover(self,
+                      requeue: bool = False,
+                      deadline: float | None = None) -> None:
         """
         This method asks the server to redeliver all unacknowledged messages on a specified channel.
         Zero or more messages may be redelivered. This method replaces the asynchronous Recover.
@@ -2470,10 +2529,14 @@ class BlockingChannel:
         :param requeue: If False, the message will be redelivered to the original recipient. If
             True, the server will attempt to requeue the message, potentially then delivering it to
             an alternative subscriber.
+        :param deadline: Seconds to wait for Basic.RecoverOk, or None (the default) to wait
+            indefinitely; see `pika.channel.Channel.basic_recover`.
+        :raises pika.exceptions.ChannelRpcTimeout: if *deadline* expires
         """
         with _CallbackResult[None]() as recover_ok_result:
             self._impl.basic_recover(requeue=requeue,
-                                     callback=recover_ok_result.signal_once)
+                                     callback=recover_ok_result.signal_once,
+                                     deadline=deadline)
             self._flush_output(recover_ok_result.is_ready)
 
     def basic_reject(self, delivery_tag: int = 0, requeue: bool = True) -> None:
@@ -2491,12 +2554,17 @@ class BlockingChannel:
         self._impl.basic_reject(delivery_tag=delivery_tag, requeue=requeue)
         self._flush_output()
 
-    def confirm_delivery(self) -> None:
+    def confirm_delivery(self,
+                         deadline: float | None = None) -> None:
         """
         Turn on RabbitMQ-proprietary Confirm mode in the channel.
 
         For more information see:
             https://www.rabbitmq.com/confirms.html
+
+        :param deadline: Seconds to wait for Confirm.SelectOk, or None (the default) to wait
+            indefinitely; see `pika.channel.Channel.confirm_delivery`.
+        :raises pika.exceptions.ChannelRpcTimeout: if *deadline* expires
         """
         if self._delivery_confirmation:
             LOGGER.error(
@@ -2508,7 +2576,8 @@ class BlockingChannel:
             self._impl.confirm_delivery(
                 ack_nack_callback=self._message_confirmation_result.
                 set_value_once,
-                callback=select_ok_result.signal_once)
+                callback=select_ok_result.signal_once,
+                deadline=deadline)
 
             self._flush_output(select_ok_result.is_ready)
 
@@ -2526,7 +2595,8 @@ class BlockingChannel:
         durable: bool = False,
         auto_delete: bool = False,
         internal: bool = False,
-        arguments: dict[str, Any] | None = None
+        arguments: dict[str, Any] | None = None,
+        deadline: float | None = None
     ) -> pika.frame.Method[pika.spec.Exchange.DeclareOk]:
         """
         This method creates an exchange if it does not already exist, and if the exchange exists,
@@ -2546,7 +2616,10 @@ class BlockingChannel:
         :param auto_delete: Remove when no more queues are bound to it
         :param internal: Can only be published to by other exchanges
         :param arguments: Custom key/value pair arguments for the exchange
+        :param deadline: Seconds to wait for Exchange.DeclareOk, or None (the default) to wait
+            indefinitely; see `pika.channel.Channel.exchange_declare`.
         :returns: Method frame from the Exchange.Declare-ok response
+        :raises pika.exceptions.ChannelRpcTimeout: if *deadline* expires
         """
         validators.require_string(exchange, 'exchange')
         with _CallbackResult[pika.frame.Method[
@@ -2558,27 +2631,33 @@ class BlockingChannel:
                                         auto_delete=auto_delete,
                                         internal=internal,
                                         arguments=arguments,
-                                        callback=declare_ok_result.set_reply)
+                                        callback=declare_ok_result.set_reply,
+                                        deadline=deadline)
 
             self._flush_output(declare_ok_result.is_ready)
             return declare_ok_result.value
 
     def exchange_delete(self,
                         exchange: str | None = None,
-                        if_unused: bool = False
+                        if_unused: bool = False,
+                        deadline: float | None = None
                        ) -> pika.frame.Method[pika.spec.Exchange.DeleteOk]:
         """
         Delete the exchange.
 
         :param exchange: The exchange name
         :param if_unused: only delete if the exchange is unused
+        :param deadline: Seconds to wait for Exchange.DeleteOk, or None (the default) to wait
+            indefinitely; see `pika.channel.Channel.exchange_delete`.
         :returns: Method frame from the Exchange.Delete-ok response
+        :raises pika.exceptions.ChannelRpcTimeout: if *deadline* expires
         """
         with _CallbackResult[pika.frame.Method[
                 pika.spec.Exchange.DeleteOk]]() as delete_ok_result:
             self._impl.exchange_delete(exchange=exchange,
                                        if_unused=if_unused,
-                                       callback=delete_ok_result.set_reply)
+                                       callback=delete_ok_result.set_reply,
+                                       deadline=deadline)
 
             self._flush_output(delete_ok_result.is_ready)
             return delete_ok_result.value
@@ -2588,7 +2667,8 @@ class BlockingChannel:
         destination: str,
         source: str,
         routing_key: str = '',
-        arguments: dict[str, Any] | None = None
+        arguments: dict[str, Any] | None = None,
+        deadline: float | None = None
     ) -> pika.frame.Method[pika.spec.Exchange.BindOk]:
         """
         Bind an exchange to another exchange.
@@ -2597,7 +2677,10 @@ class BlockingChannel:
         :param source: The source exchange to bind to
         :param routing_key: The routing key to bind on
         :param arguments: Custom key/value pair arguments for the binding
+        :param deadline: Seconds to wait for Exchange.BindOk, or None (the default) to wait
+            indefinitely; see `pika.channel.Channel.exchange_bind`.
         :returns: Method frame from the Exchange.Bind-ok response
+        :raises pika.exceptions.ChannelRpcTimeout: if *deadline* expires
         """
         validators.require_string(destination, 'destination')
         validators.require_string(source, 'source')
@@ -2607,7 +2690,8 @@ class BlockingChannel:
                                      source=source,
                                      routing_key=routing_key,
                                      arguments=arguments,
-                                     callback=bind_ok_result.set_reply)
+                                     callback=bind_ok_result.set_reply,
+                                     deadline=deadline)
 
             self._flush_output(bind_ok_result.is_ready)
             return bind_ok_result.value
@@ -2617,7 +2701,8 @@ class BlockingChannel:
         destination: str | None = None,
         source: str | None = None,
         routing_key: str = '',
-        arguments: dict[str, Any] | None = None
+        arguments: dict[str, Any] | None = None,
+        deadline: float | None = None
     ) -> pika.frame.Method[pika.spec.Exchange.UnbindOk]:
         """
         Unbind an exchange from another exchange.
@@ -2626,7 +2711,10 @@ class BlockingChannel:
         :param source: The source exchange to unbind from
         :param routing_key: The routing key to unbind
         :param arguments: Custom key/value pair arguments for the binding
+        :param deadline: Seconds to wait for Exchange.UnbindOk, or None (the default) to wait
+            indefinitely; see `pika.channel.Channel.exchange_unbind`.
         :returns: Method frame from the Exchange.Unbind-ok response
+        :raises pika.exceptions.ChannelRpcTimeout: if *deadline* expires
         """
         with _CallbackResult[pika.frame.Method[
                 pika.spec.Exchange.UnbindOk]]() as unbind_ok_result:
@@ -2634,7 +2722,8 @@ class BlockingChannel:
                                        source=source,
                                        routing_key=routing_key,
                                        arguments=arguments,
-                                       callback=unbind_ok_result.set_reply)
+                                       callback=unbind_ok_result.set_reply,
+                                       deadline=deadline)
 
             self._flush_output(unbind_ok_result.is_ready)
             return unbind_ok_result.value
@@ -2646,7 +2735,8 @@ class BlockingChannel:
         durable: bool = False,
         exclusive: bool = False,
         auto_delete: bool = False,
-        arguments: dict[str, Any] | None = None
+        arguments: dict[str, Any] | None = None,
+        deadline: float | None = None
     ) -> pika.frame.Method[pika.spec.Queue.DeclareOk]:
         """
         Declare queue, create if needed.
@@ -2667,7 +2757,10 @@ class BlockingChannel:
         :param exclusive: Only allow access by the current connection
         :param auto_delete: Delete after consumer cancels or disconnects
         :param arguments: Custom key/value arguments for the queue
+        :param deadline: Seconds to wait for Queue.DeclareOk, or None (the default) to wait
+            indefinitely; see `pika.channel.Channel.queue_declare`.
         :returns: Method frame from the Queue.Declare-ok response
+        :raises pika.exceptions.ChannelRpcTimeout: if *deadline* expires
         """
         validators.require_string(queue, 'queue')
         with _CallbackResult[pika.frame.Method[
@@ -2678,7 +2771,8 @@ class BlockingChannel:
                                      exclusive=exclusive,
                                      auto_delete=auto_delete,
                                      arguments=arguments,
-                                     callback=declare_ok_result.set_reply)
+                                     callback=declare_ok_result.set_reply,
+                                     deadline=deadline)
 
             self._flush_output(declare_ok_result.is_ready)
             return declare_ok_result.value
@@ -2686,7 +2780,8 @@ class BlockingChannel:
     def queue_delete(self,
                      queue: str,
                      if_unused: bool = False,
-                     if_empty: bool = False
+                     if_empty: bool = False,
+                     deadline: float | None = None
                     ) -> pika.frame.Method[pika.spec.Queue.DeleteOk]:
         """
         Delete a queue from the broker.
@@ -2694,30 +2789,40 @@ class BlockingChannel:
         :param queue: The queue to delete
         :param if_unused: only delete if it's unused
         :param if_empty: only delete if the queue is empty
+        :param deadline: Seconds to wait for Queue.DeleteOk, or None (the default) to wait
+            indefinitely; see `pika.channel.Channel.queue_delete`.
         :returns: Method frame from the Queue.Delete-ok response
+        :raises pika.exceptions.ChannelRpcTimeout: if *deadline* expires
         """
         with _CallbackResult[pika.frame.Method[
                 pika.spec.Queue.DeleteOk]]() as delete_ok_result:
             self._impl.queue_delete(queue=queue,
                                     if_unused=if_unused,
                                     if_empty=if_empty,
-                                    callback=delete_ok_result.set_reply)
+                                    callback=delete_ok_result.set_reply,
+                                    deadline=deadline)
 
             self._flush_output(delete_ok_result.is_ready)
             return delete_ok_result.value
 
     def queue_purge(self,
-                    queue: str) -> pika.frame.Method[pika.spec.Queue.PurgeOk]:
+                    queue: str,
+                    deadline: float | None = None
+                   ) -> pika.frame.Method[pika.spec.Queue.PurgeOk]:
         """
         Purge all of the messages from the specified queue.
 
         :param queue: The queue to purge
+        :param deadline: Seconds to wait for Queue.PurgeOk, or None (the default) to wait
+            indefinitely; see `pika.channel.Channel.queue_purge`.
         :returns: Method frame from the Queue.Purge-ok response
+        :raises pika.exceptions.ChannelRpcTimeout: if *deadline* expires
         """
         with _CallbackResult[pika.frame.Method[
                 pika.spec.Queue.PurgeOk]]() as purge_ok_result:
             self._impl.queue_purge(queue=queue,
-                                   callback=purge_ok_result.set_reply)
+                                   callback=purge_ok_result.set_reply,
+                                   deadline=deadline)
             self._flush_output(purge_ok_result.is_ready)
             return purge_ok_result.value
 
@@ -2726,7 +2831,8 @@ class BlockingChannel:
         queue: str,
         exchange: str,
         routing_key: str | None = None,
-        arguments: dict[str, Any] | None = None
+        arguments: dict[str, Any] | None = None,
+        deadline: float | None = None
     ) -> pika.frame.Method[pika.spec.Queue.BindOk]:
         """
         Bind the queue to the specified exchange.
@@ -2735,7 +2841,10 @@ class BlockingChannel:
         :param exchange: The source exchange to bind to
         :param routing_key: The routing key to bind on
         :param arguments: Custom key/value pair arguments for the binding
+        :param deadline: Seconds to wait for Queue.BindOk, or None (the default) to wait
+            indefinitely; see `pika.channel.Channel.queue_bind`.
         :returns: Method frame from the Queue.Bind-ok response
+        :raises pika.exceptions.ChannelRpcTimeout: if *deadline* expires
         """
         validators.require_string(queue, 'queue')
         validators.require_string(exchange, 'exchange')
@@ -2745,7 +2854,8 @@ class BlockingChannel:
                                   exchange=exchange,
                                   routing_key=routing_key,
                                   arguments=arguments,
-                                  callback=bind_ok_result.set_reply)
+                                  callback=bind_ok_result.set_reply,
+                                  deadline=deadline)
             self._flush_output(bind_ok_result.is_ready)
             return bind_ok_result.value
 
@@ -2754,7 +2864,8 @@ class BlockingChannel:
         queue: str,
         exchange: str,
         routing_key: str | None = None,
-        arguments: dict[str, Any] | None = None
+        arguments: dict[str, Any] | None = None,
+        deadline: float | None = None
     ) -> pika.frame.Method[pika.spec.Queue.UnbindOk]:
         """
         Unbind a queue from an exchange.
@@ -2763,7 +2874,10 @@ class BlockingChannel:
         :param exchange: The source exchange to bind from
         :param routing_key: The routing key to unbind
         :param arguments: Custom key/value pair arguments for the binding
+        :param deadline: Seconds to wait for Queue.UnbindOk, or None (the default) to wait
+            indefinitely; see `pika.channel.Channel.queue_unbind`.
         :returns: Method frame from the Queue.Unbind-ok response
+        :raises pika.exceptions.ChannelRpcTimeout: if *deadline* expires
         """
         with _CallbackResult[pika.frame.Method[
                 pika.spec.Queue.UnbindOk]]() as unbind_ok_result:
@@ -2771,48 +2885,67 @@ class BlockingChannel:
                                     exchange=exchange,
                                     routing_key=routing_key,
                                     arguments=arguments,
-                                    callback=unbind_ok_result.set_reply)
+                                    callback=unbind_ok_result.set_reply,
+                                    deadline=deadline)
             self._flush_output(unbind_ok_result.is_ready)
             return unbind_ok_result.value
 
-    def tx_select(self) -> pika.frame.Method[pika.spec.Tx.SelectOk]:
+    def tx_select(self,
+                  deadline: float | None = None
+                 ) -> pika.frame.Method[pika.spec.Tx.SelectOk]:
         """
         Select standard transaction mode.
 
         This method sets the channel to use standard transactions. The client must use this method
         at least once on a channel before using the Commit or Rollback methods.
 
+        :param deadline: Seconds to wait for Tx.SelectOk, or None (the default) to wait
+            indefinitely; see `pika.channel.Channel.tx_select`.
         :returns: Method frame from the Tx.Select-ok response
+        :raises pika.exceptions.ChannelRpcTimeout: if *deadline* expires
         """
         with _CallbackResult[pika.frame.Method[
                 pika.spec.Tx.SelectOk]]() as select_ok_result:
-            self._impl.tx_select(select_ok_result.set_reply)
+            self._impl.tx_select(select_ok_result.set_reply,
+                                 deadline=deadline)
 
             self._flush_output(select_ok_result.is_ready)
             return select_ok_result.value
 
-    def tx_commit(self) -> pika.frame.Method[pika.spec.Tx.CommitOk]:
+    def tx_commit(self,
+                  deadline: float | None = None
+                 ) -> pika.frame.Method[pika.spec.Tx.CommitOk]:
         """
         Commit a transaction.
 
+        :param deadline: Seconds to wait for Tx.CommitOk, or None (the default) to wait
+            indefinitely; see `pika.channel.Channel.tx_commit`.
         :returns: Method frame from the Tx.Commit-ok response
+        :raises pika.exceptions.ChannelRpcTimeout: if *deadline* expires
         """
         with _CallbackResult[pika.frame.Method[
                 pika.spec.Tx.CommitOk]]() as commit_ok_result:
-            self._impl.tx_commit(commit_ok_result.set_reply)
+            self._impl.tx_commit(commit_ok_result.set_reply,
+                                 deadline=deadline)
 
             self._flush_output(commit_ok_result.is_ready)
             return commit_ok_result.value
 
-    def tx_rollback(self) -> pika.frame.Method[pika.spec.Tx.RollbackOk]:
+    def tx_rollback(self,
+                    deadline: float | None = None
+                   ) -> pika.frame.Method[pika.spec.Tx.RollbackOk]:
         """
         Rollback a transaction.
 
+        :param deadline: Seconds to wait for Tx.RollbackOk, or None (the default) to wait
+            indefinitely; see `pika.channel.Channel.tx_rollback`.
         :returns: Method frame from the Tx.Rollback-ok response
+        :raises pika.exceptions.ChannelRpcTimeout: if *deadline* expires
         """
         with _CallbackResult[pika.frame.Method[
                 pika.spec.Tx.RollbackOk]]() as rollback_ok_result:
-            self._impl.tx_rollback(rollback_ok_result.set_reply)
+            self._impl.tx_rollback(rollback_ok_result.set_reply,
+                                   deadline=deadline)
 
             self._flush_output(rollback_ok_result.is_ready)
             return rollback_ok_result.value

@@ -83,6 +83,8 @@ class Channel:
 
     _ON_CHANNEL_CLEANUP_CB_KEY = '_on_channel_cleanup'
 
+    _ON_RPC_TIMEOUT_CB_KEY = '_on_channel_rpc_timeout'
+
     # Upper bound on the number of nowait-cancelled consumer tags retained in
     # `_cancelled`; see `_retain_cancelled_tag`.
     _MAX_RETAINED_CANCELLED_TAGS = 1024
@@ -140,6 +142,21 @@ class Channel:
         # open, reported once on the transition to CLOSED.
         self._discarded_while_closing: int = 0
 
+        # Per-RPC deadline bookkeeping; see `_rpc`. `_rpc_deadline` is the
+        # seconds budget of the in-flight RPC (None when it has none),
+        # `_rpc_timer` the handle of its expiry timer, `_rpc_timer_token` a
+        # token identifying that timer's callback, `_rpc_registered` the
+        # (reply, callback, arguments) tuples the in-flight RPC added to the
+        # CallbackManager, and `_rpc_expiry_error` the expiry, kept so later
+        # synchronous RPCs raise the same reason.
+        self._rpc_deadline: float | None = None
+        self._rpc_timer: object | None = None
+        self._rpc_timer_token: object | None = None
+        self._rpc_registered: list[tuple[type[amqp_object.Method],
+                                          Callable[..., Any],
+                                          dict[str, Any] | None]] = []
+        self._rpc_expiry_error: exceptions.ChannelRpcTimeout | None = None
+
     def __int__(self) -> int:
         """Return the channel object as its channel number."""
         return self.channel_number
@@ -195,6 +212,38 @@ class Channel:
         """
         self.callbacks.add(self.channel_number, '_on_channel_close', callback,
                            False, self)
+
+    def add_on_rpc_timeout_callback(
+            self, callback: Callable[['Channel', exceptions.ChannelRpcTimeout],
+                                     Any]) -> None:
+        """
+        Register a callback invoked when a synchronous RPC's ``deadline`` expires before its reply
+        arrives.
+
+        The callback receives the channel and the
+        [`ChannelRpcTimeout`][pika.exceptions.ChannelRpcTimeout] that describes the expiry. It runs
+        on the connection's I/O loop, inside the deadline timer.
+        Use it to turn the expiry into an exception for a blocking wrapper or to trigger recovery;
+        the core channel does not close itself.
+
+        :param callback: callback(Channel, ChannelRpcTimeout)
+        """
+        self.callbacks.add(self.channel_number, self._ON_RPC_TIMEOUT_CB_KEY,
+                           callback, False, self)
+
+    def remove_on_rpc_timeout_callback(
+            self, callback: Callable[['Channel', exceptions.ChannelRpcTimeout],
+                                     Any]) -> bool:
+        """
+        Remove a callback registered via
+        [`add_on_rpc_timeout_callback`][pika.channel.Channel.add_on_rpc_timeout_callback].
+
+        :param callback: The callback to remove
+        :returns:``True`` if the callback was removed, ``False`` if it was absent
+        """
+        return self.callbacks.remove_matching(
+            self.channel_number, self._ON_RPC_TIMEOUT_CB_KEY,
+            lambda cb: cb == callback)
 
     def add_on_flow_callback(self, callback: _OnFlowCallback) -> None:
         """
@@ -316,7 +365,8 @@ class Channel:
 
     def basic_cancel(self,
                      consumer_tag: str = '',
-                     callback: _OnBasicCancelCallback | None = None) -> None:
+                     callback: _OnBasicCancelCallback | None = None,
+                     deadline: float | None = None) -> None:
         """
         This method cancels a consumer.
 
@@ -344,6 +394,8 @@ class Channel:
             consumer_tag. If None, do not expect a Basic.CancelOk response, otherwise, callback must
             be callable. A tag that is unknown or already cancelling is still sent to the broker
             when there is a callback, so the callback completes on the broker's reply.
+        :param deadline: Seconds to wait for the Basic.CancelOk, or None (the default) to wait
+            indefinitely; see `_rpc`. Requires a ``callback``.
         :raises ValueError:
         """
         validators.require_string(consumer_tag, 'consumer_tag')
@@ -358,13 +410,13 @@ class Channel:
             # reports that rather than reporting itself as unknown.
             log('basic_cancel - consumer is already cancelling: %s',
                 consumer_tag)
-            self._cancel_without_retiring(consumer_tag, callback)
+            self._cancel_without_retiring(consumer_tag, callback, deadline)
             return
 
         if consumer_tag not in self._consumers:
             # Could be cancelled by user or broker earlier
             log('basic_cancel - consumer not found: %s', consumer_tag)
-            self._cancel_without_retiring(consumer_tag, callback)
+            self._cancel_without_retiring(consumer_tag, callback, deadline)
             return
 
         LOGGER.debug('Cancelling consumer: %s (nowait=%s)', consumer_tag,
@@ -389,11 +441,12 @@ class Channel:
                       functools.partial(self._on_cancelok, callback=callback),
                       [(spec.Basic.CancelOk, {
                           'consumer_tag': consumer_tag
-                      })])
+                      })], **self._deadline_kwargs(deadline))
 
     def _cancel_without_retiring(
             self, consumer_tag: str,
-            callback: _OnBasicCancelCallback | None) -> None:
+            callback: _OnBasicCancelCallback | None,
+            deadline: float | None = None) -> None:
         """
         Ask the broker to cancel a tag that is unknown or already cancelling, and report its answer.
 
@@ -402,13 +455,14 @@ class Channel:
 
         :param consumer_tag: The tag to cancel
         :param callback: As for `basic_cancel`; ``None`` sends nothing
+        :param deadline: As for `basic_cancel`
         """
         if callback is None:
             return
         self._rpc(spec.Basic.Cancel(consumer_tag=consumer_tag), callback,
                   [(spec.Basic.CancelOk, {
                       'consumer_tag': consumer_tag
-                  })])
+                  })], **self._deadline_kwargs(deadline))
 
     def basic_consume(self,
                       queue: str,
@@ -417,7 +471,8 @@ class Channel:
                       exclusive: bool = False,
                       consumer_tag: str | None = None,
                       arguments: dict[str, Any] | None = None,
-                      callback: _OnBasicConsumeCallback | None = None) -> str:
+                      callback: _OnBasicConsumeCallback | None = None,
+                      deadline: float | None = None) -> str:
         """
         Sends the AMQP 0-9-1 command Basic.Consume to the broker and binds messages for the
         consumer_tag to the consumer callback. If you do not pass in a consumer_tag, one will be
@@ -446,6 +501,8 @@ class Channel:
         :param arguments: Custom key/value pair arguments for the consumer
         :param callback: callback(pika.frame.Method) for method
           Basic.ConsumeOk.
+        :param deadline: Seconds to wait for Basic.ConsumeOk, or None (the default) to wait
+            indefinitely; see `_rpc`.
         :returns: Consumer tag which may be used to cancel the consumer.
         :raises ValueError:
         """
@@ -475,7 +532,7 @@ class Channel:
                                arguments=arguments or {}), rpc_callback,
             [(spec.Basic.ConsumeOk, {
                 'consumer_tag': consumer_tag
-            })])
+            })], **self._deadline_kwargs(deadline))
 
         return consumer_tag
 
@@ -612,7 +669,8 @@ class Channel:
                   prefetch_size: int = 0,
                   prefetch_count: int = 0,
                   global_qos: bool = False,
-                  callback: _OnBasicQosCallback | None = None) -> None:
+                  callback: _OnBasicQosCallback | None = None,
+                  deadline: float | None = None) -> None:
         """
         Specify quality of service.
 
@@ -633,6 +691,8 @@ class Channel:
             it. The prefetch-count is ignored by consumers who have enabled the no-ack option.
         :param global_qos: Should the QoS be shared across all consumers on the channel.
         :param callback: The callback to call for Basic.QosOk response
+        :param deadline: Seconds to wait for Basic.QosOk, or None (the default) to wait
+            indefinitely; see `_rpc`.
         :returns:``None``. Method frame from the Basic.Qos-ok response is delivered to ``callback``
             when provided.
         :raises ValueError:
@@ -643,7 +703,7 @@ class Channel:
         validators.zero_or_greater('prefetch_count', prefetch_count)
         return self._rpc(
             spec.Basic.Qos(prefetch_size, prefetch_count, global_qos), callback,
-            [spec.Basic.QosOk])
+            [spec.Basic.QosOk], **self._deadline_kwargs(deadline))
 
     def basic_reject(self, delivery_tag: int = 0, requeue: bool = True) -> None:
         """
@@ -665,7 +725,8 @@ class Channel:
 
     def basic_recover(self,
                       requeue: bool = False,
-                      callback: _OnBasicRecoverCallback | None = None) -> None:
+                      callback: _OnBasicRecoverCallback | None = None,
+                      deadline: float | None = None) -> None:
         """
         This method asks the server to redeliver all unacknowledged messages on a specified channel.
         Zero or more messages may be redelivered. This method replaces the asynchronous Recover.
@@ -674,6 +735,8 @@ class Channel:
             True, the server will attempt to requeue the message, potentially then delivering it to
             an alternative subscriber.
         :param callback: callback(pika.frame.Method) for method Basic.RecoverOk
+        :param deadline: Seconds to wait for Basic.RecoverOk, or None (the default) to wait
+            indefinitely; see `_rpc`.
         :returns:``None``. Method frame from the Basic.Recover-ok response is delivered to
             ``callback`` when provided.
         :raises ValueError:
@@ -681,7 +744,7 @@ class Channel:
         self._raise_if_not_open()
         validators.rpc_completion_callback(callback)
         return self._rpc(spec.Basic.Recover(requeue), callback,
-                         [spec.Basic.RecoverOk])
+                         [spec.Basic.RecoverOk], **self._deadline_kwargs(deadline))
 
     def close(self,
               reply_code: int = 0,
@@ -709,6 +772,20 @@ class Channel:
             # to be called, which won't happen when it's already closed.
             self._raise_if_not_open()
 
+        if self._rpc_expiry_error is not None:
+            # A synchronous RPC expired without its reply. A `Channel.Close`
+            # now could be answered by the overdue reply instead of
+            # `Channel.CloseOk` - AMQP replies carry no request id - so do not
+            # put one on the wire. Tear down the local state directly; the
+            # broker keeps the channel open until the connection closes or it
+            # reaps the idle channel itself.
+            LOGGER.warning(
+                'Meta-closing channel %i after an RPC deadline expired; '
+                'the broker side of the channel is not being closed',
+                self.channel_number)
+            self._on_close_meta(self._rpc_expiry_error)
+            return
+
         # If channel is OPENING, we will transition it to CLOSING state,
         # causing the _on_openok method to suppress the OPEN state transition
         # and the on-channel-open-callback
@@ -735,7 +812,8 @@ class Channel:
     def confirm_delivery(
             self,
             ack_nack_callback: _OnAckNackCallback,
-            callback: _OnConfirmDeliveryCallback | None = None) -> None:
+            callback: _OnConfirmDeliveryCallback | None = None,
+            deadline: float | None = None) -> None:
         """
         Turn on Confirm mode in the channel.
 
@@ -751,6 +829,8 @@ class Channel:
             either method `spec.Basic.Ack` or `spec.Basic.Nack`.
         :param callback: callback(pika.frame.Method) for method
             Confirm.SelectOk
+        :param deadline: Seconds to wait for Confirm.SelectOk, or None (the default) to wait
+            indefinitely; see `_rpc`. Requires a ``callback``.
         :raises TypeError: if `ack_nack_callback` is not callable
 
         .. note::
@@ -789,7 +869,8 @@ class Channel:
         self._on_ack_nack_callback = ack_nack_callback
 
         self._rpc(spec.Confirm.Select(nowait), callback,
-                  [spec.Confirm.SelectOk] if not nowait else [])
+                  [spec.Confirm.SelectOk] if not nowait else [],
+                  **self._deadline_kwargs(deadline))
 
     @property
     def consumer_tags(self) -> list[str]:
@@ -806,7 +887,8 @@ class Channel:
                       source: str,
                       routing_key: str = '',
                       arguments: dict[str, Any] | None = None,
-                      callback: _OnExchangeBindCallback | None = None) -> None:
+                      callback: _OnExchangeBindCallback | None = None,
+                      deadline: float | None = None) -> None:
         """
         Bind an exchange to another exchange.
 
@@ -815,6 +897,8 @@ class Channel:
         :param routing_key: The routing key to bind on
         :param arguments: Custom key/value pair arguments for the binding
         :param callback: callback(pika.frame.Method) for method Exchange.BindOk
+        :param deadline: Seconds to wait for Exchange.BindOk, or None (the default) to wait
+            indefinitely; see `_rpc`. Requires a ``callback``.
         :returns:``None``. Method frame from the Exchange.Bind-ok response is delivered to
             ``callback`` when synchronous (no ok frame in nowait mode).
         :raises ValueError:
@@ -826,7 +910,7 @@ class Channel:
         return self._rpc(
             spec.Exchange.Bind(0, destination, source, routing_key, nowait,
                                arguments or {}), callback,
-            [spec.Exchange.BindOk] if not nowait else [])
+            [spec.Exchange.BindOk] if not nowait else [], **self._deadline_kwargs(deadline))
 
     def exchange_declare(
             self,
@@ -837,7 +921,8 @@ class Channel:
             auto_delete: bool = False,
             internal: bool = False,
             arguments: dict[str, Any] | None = None,
-            callback: _OnExchangeDeclareCallback | None = None) -> None:
+            callback: _OnExchangeDeclareCallback | None = None,
+            deadline: float | None = None) -> None:
         """
         This method creates an exchange if it does not already exist, and if the exchange exists,
         verifies that it is of the correct and expected class.
@@ -857,6 +942,8 @@ class Channel:
         :param internal: Can only be published to by other exchanges
         :param arguments: Custom key/value pair arguments for the exchange
         :param callback: callback(pika.frame.Method) for method Exchange.DeclareOk
+        :param deadline: Seconds to wait for Exchange.DeclareOk, or None (the default) to wait
+            indefinitely; see `_rpc`. Requires a ``callback``.
         :returns: ``None``. Method frame from the Exchange.Declare-ok response is
             delivered to ``callback`` when synchronous (no ok frame in nowait
             mode).
@@ -871,19 +958,23 @@ class Channel:
             spec.Exchange.Declare(0, exchange, exchange_type, passive, durable,
                                   auto_delete, internal, nowait, arguments or
                                   {}), callback,
-            [spec.Exchange.DeclareOk] if not nowait else [])
+            [spec.Exchange.DeclareOk] if not nowait else [],
+            **self._deadline_kwargs(deadline))
 
     def exchange_delete(
             self,
             exchange: str | None = None,
             if_unused: bool = False,
-            callback: _OnExchangeDeleteCallback | None = None) -> None:
+            callback: _OnExchangeDeleteCallback | None = None,
+            deadline: float | None = None) -> None:
         """
         Delete the exchange.
 
         :param exchange: The exchange name
         :param if_unused: only delete if the exchange is unused
         :param callback: callback(pika.frame.Method) for method Exchange.DeleteOk
+        :param deadline: Seconds to wait for Exchange.DeleteOk, or None (the default) to wait
+            indefinitely; see `_rpc`. Requires a ``callback``.
         :returns:``None``. Method frame from the Exchange.Delete-ok response is delivered to
             ``callback`` when synchronous (no ok frame in nowait mode).
         :raises ValueError:
@@ -892,7 +983,8 @@ class Channel:
         nowait = validators.rpc_completion_callback(callback)
         return self._rpc(spec.Exchange.Delete(0, exchange, if_unused,
                                               nowait), callback,
-                         [spec.Exchange.DeleteOk] if not nowait else [])
+                         [spec.Exchange.DeleteOk] if not nowait else [],
+                         **self._deadline_kwargs(deadline))
 
     def exchange_unbind(
             self,
@@ -900,7 +992,8 @@ class Channel:
             source: str | None = None,
             routing_key: str = '',
             arguments: dict[str, Any] | None = None,
-            callback: _OnExchangeUnbindCallback | None = None) -> None:
+            callback: _OnExchangeUnbindCallback | None = None,
+            deadline: float | None = None) -> None:
         """
         Unbind an exchange from another exchange.
 
@@ -909,6 +1002,8 @@ class Channel:
         :param routing_key: The routing key to unbind
         :param arguments: Custom key/value pair arguments for the binding
         :param callback: callback(pika.frame.Method) for method Exchange.UnbindOk
+        :param deadline: Seconds to wait for Exchange.UnbindOk, or None (the default) to wait
+            indefinitely; see `_rpc`. Requires a ``callback``.
         :returns:``None``. Method frame from the Exchange.Unbind-ok response is delivered to
             ``callback`` when synchronous (no ok frame in nowait mode).
         :raises ValueError:
@@ -918,11 +1013,12 @@ class Channel:
         return self._rpc(
             spec.Exchange.Unbind(0, destination, source, routing_key, nowait,
                                  arguments), callback,
-            [spec.Exchange.UnbindOk] if not nowait else [])
+            [spec.Exchange.UnbindOk] if not nowait else [], **self._deadline_kwargs(deadline))
 
     def flow(self,
              active: bool,
-             callback: _OnFlowCallback | None = None) -> None:
+             callback: _OnFlowCallback | None = None,
+             deadline: float | None = None) -> None:
         """
         Turn Channel flow control off and on.
 
@@ -934,13 +1030,15 @@ class Channel:
 
         :param active: Turn flow on or off
         :param callback: callback(bool) upon completion
+        :param deadline: Seconds to wait for Channel.FlowOk, or None (the default) to wait
+            indefinitely; see `_rpc`.
         :raises ValueError:
         """
         self._raise_if_not_open()
         validators.rpc_completion_callback(callback)
         self._on_flowok_callback = callback
         self._rpc(spec.Channel.Flow(active), self._on_flowok,
-                  [spec.Channel.FlowOk])
+                  [spec.Channel.FlowOk], **self._deadline_kwargs(deadline))
 
     @property
     def is_closed(self) -> bool:
@@ -973,7 +1071,8 @@ class Channel:
                    exchange: str,
                    routing_key: str | None = None,
                    arguments: dict[str, Any] | None = None,
-                   callback: _OnQueueBindCallback | None = None) -> None:
+                   callback: _OnQueueBindCallback | None = None,
+                   deadline: float | None = None) -> None:
         """
         Bind the queue to the specified exchange.
 
@@ -982,6 +1081,8 @@ class Channel:
         :param routing_key: The routing key to bind on
         :param arguments: Custom key/value pair arguments for the binding
         :param callback: callback(pika.frame.Method) for method Queue.BindOk
+        :param deadline: Seconds to wait for Queue.BindOk, or None (the default) to wait
+            indefinitely; see `_rpc`. Requires a ``callback``.
         :returns:``None``. Method frame from the Queue.Bind-ok response is delivered to ``callback``
             when synchronous (no ok frame in nowait mode).
         :raises ValueError:
@@ -995,7 +1096,7 @@ class Channel:
         return self._rpc(
             spec.Queue.Bind(0, queue, exchange, routing_key, nowait,
                             arguments or {}), callback,
-            [spec.Queue.BindOk] if not nowait else [])
+            [spec.Queue.BindOk] if not nowait else [], **self._deadline_kwargs(deadline))
 
     def queue_declare(self,
                       queue: str,
@@ -1004,7 +1105,8 @@ class Channel:
                       exclusive: bool = False,
                       auto_delete: bool = False,
                       arguments: dict[str, Any] | None = None,
-                      callback: _OnQueueDeclareCallback | None = None) -> None:
+                      callback: _OnQueueDeclareCallback | None = None,
+                      deadline: float | None = None) -> None:
         """
         Declare queue, create if needed.
 
@@ -1023,6 +1125,8 @@ class Channel:
         :param auto_delete: Delete after consumer cancels or disconnects
         :param arguments: Custom key/value arguments for the queue
         :param callback: callback(pika.frame.Method) for method Queue.DeclareOk
+        :param deadline: Seconds to wait for Queue.DeclareOk, or None (the default) to wait
+            indefinitely; see `_rpc`. Requires a ``callback``.
         :returns: ``None``. Method frame from the Queue.Declare-ok response is
             delivered to ``callback`` when synchronous (no ok frame in nowait
             mode).
@@ -1042,13 +1146,14 @@ class Channel:
         return self._rpc(
             spec.Queue.Declare(0, queue, passive, durable, exclusive,
                                auto_delete, nowait, arguments or {}), callback,
-            replies)
+            replies, **self._deadline_kwargs(deadline))
 
     def queue_delete(self,
                      queue: str,
                      if_unused: bool = False,
                      if_empty: bool = False,
-                     callback: _OnQueueDeleteCallback | None = None) -> None:
+                     callback: _OnQueueDeleteCallback | None = None,
+                     deadline: float | None = None) -> None:
         """
         Delete a queue from the broker.
 
@@ -1056,6 +1161,8 @@ class Channel:
         :param if_unused: only delete if it's unused
         :param if_empty: only delete if the queue is empty
         :param callback: callback(pika.frame.Method) for method Queue.DeleteOk
+        :param deadline: Seconds to wait for Queue.DeleteOk, or None (the default) to wait
+            indefinitely; see `_rpc`. Requires a ``callback``.
         :returns:``None``. Method frame from the Queue.Delete-ok response is delivered to
             ``callback`` when synchronous (no ok frame in nowait mode).
         :raises ValueError:
@@ -1066,16 +1173,19 @@ class Channel:
         replies = [spec.Queue.DeleteOk] if not nowait else []
         return self._rpc(
             spec.Queue.Delete(0, queue, if_unused, if_empty, nowait), callback,
-            replies)
+            replies, **self._deadline_kwargs(deadline))
 
     def queue_purge(self,
                     queue: str,
-                    callback: _OnQueuePurgeCallback | None = None) -> None:
+                    callback: _OnQueuePurgeCallback | None = None,
+                    deadline: float | None = None) -> None:
         """
         Purge all of the messages from the specified queue.
 
         :param queue: The queue to purge
         :param callback: callback(pika.frame.Method) for method Queue.PurgeOk
+        :param deadline: Seconds to wait for Queue.PurgeOk, or None (the default) to wait
+            indefinitely; see `_rpc`. Requires a ``callback``.
         :returns:``None``. Method frame from the Queue.Purge-ok response is delivered to
             ``callback`` when synchronous (no ok frame in nowait mode).
         :raises ValueError:
@@ -1084,14 +1194,16 @@ class Channel:
         validators.require_string(queue, 'queue')
         nowait = validators.rpc_completion_callback(callback)
         replies = [spec.Queue.PurgeOk] if not nowait else []
-        return self._rpc(spec.Queue.Purge(0, queue, nowait), callback, replies)
+        return self._rpc(spec.Queue.Purge(0, queue, nowait), callback, replies,
+                         **self._deadline_kwargs(deadline))
 
     def queue_unbind(self,
                      queue: str,
                      exchange: str | None = None,
                      routing_key: str | None = None,
                      arguments: dict[str, Any] | None = None,
-                     callback: _OnQueueUnbindCallback | None = None) -> None:
+                     callback: _OnQueueUnbindCallback | None = None,
+                     deadline: float | None = None) -> None:
         """
         Unbind a queue from an exchange.
 
@@ -1100,6 +1212,8 @@ class Channel:
         :param routing_key: The routing key to unbind
         :param arguments: Custom key/value pair arguments for the binding
         :param callback: callback(pika.frame.Method) for method Queue.UnbindOk
+        :param deadline: Seconds to wait for Queue.UnbindOk, or None (the default) to wait
+            indefinitely; see `_rpc`. Requires a ``callback``.
         :returns:``None``. Method frame from the Queue.Unbind-ok response is delivered to
             ``callback`` when provided.
         :raises ValueError:
@@ -1111,36 +1225,47 @@ class Channel:
             routing_key = queue
         return self._rpc(
             spec.Queue.Unbind(0, queue, exchange, routing_key, arguments or {}),
-            callback, [spec.Queue.UnbindOk])
+            callback, [spec.Queue.UnbindOk], **self._deadline_kwargs(deadline))
 
-    def tx_commit(self, callback: _OnTxCommitCallback | None = None) -> None:
+    def tx_commit(self,
+                  callback: _OnTxCommitCallback | None = None,
+                  deadline: float | None = None) -> None:
         """
         Commit a transaction.
 
         :param callback: callback(pika.frame.Method) for method Tx.CommitOk
+        :param deadline: Seconds to wait for Tx.CommitOk, or None (the default) to wait
+            indefinitely; see `_rpc`.
         :returns:``None``. Method frame from the Tx.Commit-ok response is delivered to ``callback``
             when provided.
         :raises ValueError:
         """
         self._raise_if_not_open()
         validators.rpc_completion_callback(callback)
-        return self._rpc(spec.Tx.Commit(), callback, [spec.Tx.CommitOk])
+        return self._rpc(spec.Tx.Commit(), callback, [spec.Tx.CommitOk],
+                         **self._deadline_kwargs(deadline))
 
     def tx_rollback(self,
-                    callback: _OnTxRollbackCallback | None = None) -> None:
+                    callback: _OnTxRollbackCallback | None = None,
+                    deadline: float | None = None) -> None:
         """
         Rollback a transaction.
 
         :param callback: callback(pika.frame.Method) for method Tx.RollbackOk
+        :param deadline: Seconds to wait for Tx.RollbackOk, or None (the default) to wait
+            indefinitely; see `_rpc`.
         :returns:``None``. Method frame from the Tx.Rollback-ok response is delivered to
             ``callback`` when provided.
         :raises ValueError:
         """
         self._raise_if_not_open()
         validators.rpc_completion_callback(callback)
-        return self._rpc(spec.Tx.Rollback(), callback, [spec.Tx.RollbackOk])
+        return self._rpc(spec.Tx.Rollback(), callback, [spec.Tx.RollbackOk],
+                         **self._deadline_kwargs(deadline))
 
-    def tx_select(self, callback: _OnTxSelectCallback | None = None) -> None:
+    def tx_select(self,
+                  callback: _OnTxSelectCallback | None = None,
+                  deadline: float | None = None) -> None:
         """
         Select standard transaction mode.
 
@@ -1148,13 +1273,16 @@ class Channel:
         at least once on a channel before using the Commit or Rollback methods.
 
         :param callback: callback(pika.frame.Method) for method Tx.SelectOk
+        :param deadline: Seconds to wait for Tx.SelectOk, or None (the default) to wait
+            indefinitely; see `_rpc`.
         :returns:``None``. Method frame from the Tx.Select-ok response is delivered to ``callback``
             when provided.
         :raises ValueError:
         """
         self._raise_if_not_open()
         validators.rpc_completion_callback(callback)
-        return self._rpc(spec.Tx.Select(), callback, [spec.Tx.SelectOk])
+        return self._rpc(spec.Tx.Select(), callback, [spec.Tx.SelectOk],
+                         **self._deadline_kwargs(deadline))
 
     # Internal methods
 
@@ -1195,6 +1323,7 @@ class Channel:
 
     def _cleanup(self) -> None:
         """Remove all consumers and any callbacks for the channel."""
+        self._cancel_rpc_timer()
         self.callbacks.process(self.channel_number,
                                self._ON_CHANNEL_CLEANUP_CB_KEY, self, self)
         self._consumers = {}
@@ -1559,11 +1688,92 @@ class Channel:
         """
         LOGGER.debug('%i blocked frames', len(self._blocked))
         self._blocking = None
+        self._cancel_rpc_timer()
+        self._rpc_registered = []
         # self._blocking must be checked here as a callback could
         # potentially change the state of that variable during an
         # iteration of the while loop
         while self._blocked and self._blocking is None:
             self._rpc(*self._blocked.popleft())
+
+    def _cancel_rpc_timer(self) -> None:
+        """Cancel the deadline timer of the in-flight RPC, if it had one."""
+        if self._rpc_timer is not None:
+            self.connection._adapter_remove_timeout(self._rpc_timer)
+            self._rpc_timer = None
+        self._rpc_timer_token = None
+        self._rpc_deadline = None
+
+    def _on_rpc_timeout(self, method: amqp_object.Method,
+                        token: object) -> None:
+        """
+        Deadline callback for an RPC whose reply never arrived in time.
+
+        AMQP replies have no request identifier, so the reply this request is
+        still owed could be confused with the reply to a later identical RPC.
+        The channel therefore cannot keep issuing synchronous RPCs: detach
+        every callback the timed-out RPC registered (so a straggling reply is
+        dropped as an unexpected frame rather than completing a later call),
+        flush the operations queued behind it without sending them, and mark
+        the channel poisoned. Fire-and-forget methods that expect no reply
+        (`basic_publish`, `basic_ack`, ...) remain usable, since nothing can
+        match their frames to the outstanding reply.
+
+        The request was already on the wire, so it may have taken effect on
+        the broker; see `exceptions.ChannelRpcTimeout`.
+
+        A timer whose reply won the race is cancelled before it fires, so a
+        stale callback (including one the adapter had already queued when a
+        later RPC armed its own timer) is a no-op: the token identifies the
+        in-flight timer.
+
+        :param method: The method whose RPC expired
+        :param token: The token assigned when this timer was armed
+        """
+        if token is not self._rpc_timer_token:
+            LOGGER.debug('Discarding stale RPC deadline for %r on channel %i',
+                         method, self.channel_number)
+            return
+
+        LOGGER.warning('RPC deadline expired while waiting for a reply to '
+                       '%r on channel %i', method, self.channel_number)
+        deadline = self._rpc_deadline
+        self._rpc_timer = None
+        self._rpc_timer_token = None
+        self._rpc_deadline = None
+        self._blocking = None
+
+        for reply, reply_callback, arguments in self._rpc_registered:
+            self.callbacks.remove_matching(
+                self.channel_number, reply,
+                lambda registered, target=reply_callback: registered == target)
+        self._rpc_registered = []
+
+        while self._blocked:
+            queued = self._blocked.popleft()
+            LOGGER.debug(
+                'Discarding queued method after RPC deadline: %s', queued[0])
+
+        error = exceptions.ChannelRpcTimeout(
+            f'No reply to {method.NAME} within the {deadline}s RPC deadline; '
+            'the request may have taken effect on the broker, and the '
+            'channel can no longer issue synchronous RPCs')
+        self._rpc_expiry_error = error
+        self._on_channel_rpc_timeout(error)
+
+    def _on_channel_rpc_timeout(self,
+                                error: exceptions.ChannelRpcTimeout) -> None:
+        """
+        Notify the wrapper layer (e.g. `BlockingChannel`) that an RPC deadline expired.
+
+        The core channel stays open for fire-and-forget frames; the wrapper is what turns the
+        deadline into an exception for its caller. Wrappers register via
+        `add_on_rpc_timeout_callback`.
+
+        :param error: The `ChannelRpcTimeout` describing the expiry
+        """
+        self.callbacks.process(self.channel_number,
+                               self._ON_RPC_TIMEOUT_CB_KEY, self, self, error)
 
     def _drain_blocked_methods_on_remote_close(self) -> None:
         """
@@ -1589,13 +1799,26 @@ class Channel:
             else:
                 LOGGER.debug('Ignoring drained blocked method: %s', method)
 
+    @staticmethod
+    def _deadline_kwargs(deadline: float | None) -> dict[str, float]:
+        """Splice ``deadline`` into an `_rpc` call only when one was given.
+
+        Keeps the call shape identical for the default (no deadline) path, so a
+        request without a deadline behaves exactly as it did before deadlines
+        existed.
+
+        :param deadline: The public method's ``deadline`` argument
+        """
+        return {'deadline': deadline} if deadline is not None else {}
+
     def _rpc(
         self,
         method: amqp_object.Method,
         callback: Callable[..., Any] | None = None,
         acceptable_replies: Sequence[type[amqp_object.Method] |
                                      tuple[type[amqp_object.Method],
-                                           dict[str, Any]]] | None = None
+                                           dict[str, Any]]] | None = None,
+        deadline: float | None = None
     ) -> None:
         """
         Make a synchronous channel RPC call for a synchronous method frame.
@@ -1608,12 +1831,26 @@ class Channel:
         blocking state and register for `_on_synchronous_complete` before
         sending the request.
 
+        ``deadline`` arms a single-shot timer for the request once it is sent;
+        the timer is cancelled by the reply. If it fires, `_on_rpc_timeout`
+        detaches the request's callbacks, drops the operations queued behind
+        it, and poisons the channel for further synchronous RPCs, because a
+        late reply could otherwise be attributed to an identical later
+        request. It applies only to requests with replies, since those are the
+        ones a straggling frame could be mistaken for.
+
         NOTE: A callback must be accompanied by non-empty acceptable_replies.
 
         :param method: The AMQP method to invoke
         :param callback: The callback for the RPC response
         :param acceptable_replies: A (possibly empty) sequence of
             replies this RPC call expects or None
+        :param deadline: Seconds to wait for the reply, or None to wait indefinitely
+        :raises TypeError: if ``deadline`` is neither None nor a non-negative number
+        :raises ValueError: if ``deadline`` is given for a request with no expected reply
+        :raises ChannelWrongStateError: if the channel is closed
+        :raises ChannelRpcTimeout: if an earlier RPC's deadline expired and this
+            request expects a reply
         """
         assert method.synchronous, (
             f'Only synchronous-capable methods may be used with _rpc: {method!r}'
@@ -1633,16 +1870,33 @@ class Channel:
                 raise ValueError(
                     'Unexpected callback for asynchronous (nowait) operation.')
 
+        if deadline is not None and (isinstance(deadline, bool) or
+                                     not isinstance(deadline, (int, float)) or
+                                     not deadline >= 0):
+            raise TypeError(
+                f'deadline should be None or a non-negative number, but got '
+                f'{deadline!r}')
+
+        if deadline is not None and not acceptable_replies:
+            raise ValueError(
+                'Unexpected deadline for asynchronous (nowait) operation.')
+
         # Make sure the channel is not closed yet
         if self.is_closed:
             self._raise_if_not_open()
+
+        # A request that expects a reply can no longer be matched to its own
+        # reply once an earlier deadline expired; see `_on_rpc_timeout`.
+        if self._rpc_expiry_error is not None and acceptable_replies:
+            raise self._rpc_expiry_error
 
         # If the channel is blocking, add subsequent commands to our stack
         if self._blocking:
             LOGGER.debug(
                 'Already in blocking state, so enqueueing method %s; '
                 'acceptable_replies=%r', method, acceptable_replies)
-            self._blocked.append([method, callback, acceptable_replies])
+            self._blocked.append(
+                [method, callback, acceptable_replies, deadline])
             return
 
         # Note: _send_method can throw exceptions if there are framing errors
@@ -1659,6 +1913,7 @@ class Channel:
                 'Entering blocking state on frame %s; acceptable_replies=%r',
                 method, acceptable_replies)
 
+            registered = self._rpc_registered = []
             for reply in acceptable_replies:
                 if isinstance(reply, tuple):
                     reply, arguments = reply
@@ -1669,12 +1924,23 @@ class Channel:
                                    reply,
                                    self._on_synchronous_complete,
                                    arguments=arguments)
+                registered.append(
+                    (reply, self._on_synchronous_complete, arguments))
                 if callback is not None:
                     LOGGER.debug('Adding passed-in RPC response callback')
                     self.callbacks.add(self.channel_number,
                                        reply,
                                        callback,
                                        arguments=arguments)
+                    registered.append((reply, callback, arguments))
+
+            if deadline is not None:
+                self._rpc_deadline = deadline
+                token = object()
+                self._rpc_timer = self.connection._adapter_call_later(
+                    deadline,
+                    functools.partial(self._on_rpc_timeout, method, token))
+                self._rpc_timer_token = token
 
     def _raise_if_not_open(self) -> None:
         """

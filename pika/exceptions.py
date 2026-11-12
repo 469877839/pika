@@ -213,6 +213,30 @@ class ChannelWrongStateError(AMQPChannelError):
     """Channel is in wrong state for the requested operation."""
 
 
+class ChannelRpcTimeout(AMQPChannelError):
+    """
+    A synchronous channel RPC did not complete within its deadline.
+
+    AMQP 0.9.1 replies carry no request identifier, so once the deadline
+    expires a late reply can no longer be attributed to the request that
+    prompted it: the same reply type issued again on the channel would match
+    the straggler. The channel therefore refuses further synchronous RPCs
+    after this exception, and `pika.channel.Channel.close` performs a
+    meta-close instead of sending `Channel.Close`, whose `Channel.CloseOk`
+    could not be told apart from the overdue reply either. Open a new channel
+    to continue.
+
+    The request reached the broker before the deadline expired, so the
+    operation may already have taken effect on the server even though its
+    reply never arrived. Verify the outcome out of band (for example with a
+    passive `queue_declare` on a fresh channel) before retrying an operation
+    that is not idempotent.
+
+    Raised by `BlockingChannel` methods and by the per-RPC ``deadline``
+    argument of `pika.channel.Channel` methods.
+    """
+
+
 class ChannelClosed(AMQPChannelError):
     """The channel closed by client or by broker."""
 

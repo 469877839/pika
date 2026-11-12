@@ -4,7 +4,7 @@ Notes for each release are also published on the [GitHub releases page](https://
 
 ## Upgrading to 1.5.0
 
-Eleven changes are worth reading before you upgrade. Three can turn a passing build red, two change what a working application observes when it cancels a consumer or closes a channel, one lets RabbitMQ close a channel sooner after a consumer timeout, one refuses messages larger than 64 MiB, one changes what the Twisted adapter reports when a connection closes, one changes the Python types that field-table numbers decode to, and one makes URL `ssl_options` verify the broker.
+Twelve changes are worth reading before you upgrade. Three can turn a passing build red, two change what a working application observes when it cancels a consumer or closes a channel, one lets RabbitMQ close a channel sooner after a consumer timeout, one refuses messages larger than 64 MiB, one changes what the Twisted adapter reports when a connection closes, one changes the Python types that field-table numbers decode to, one makes URL `ssl_options` verify the broker, and one adds an explicit per-RPC deadline to the synchronous channel methods.
 
 ### `pika.Connection` is new, and is the connection to use
 
@@ -102,6 +102,12 @@ Two properties of the generated code account for it. Every generated constructor
 The errors are accurate and the annotations are an improvement, so nothing here should be reverted. The FAQ covers the narrowing idioms: https://pika.github.io/pika/latest/faq/
 
 `pyright` users see little change, since it reported most of these already.
+
+### Synchronous channel RPCs accept an explicit `deadline`
+
+`queue_declare`, `exchange_declare`, `basic_consume` and the other synchronous `Channel` RPCs now take a `deadline` keyword, the number of seconds to wait for their own reply once the request is sent. The default is `None`, which waits indefinitely as before, so code that does not pass one is unchanged. `BlockingChannel` accepts the same keyword and raises `pika.exceptions.ChannelRpcTimeout` to its caller when it expires.
+
+AMQP replies have no request id, so a reply arriving after its deadline could be mistaken for the reply to an identical later RPC. The expiry therefore poisons the channel for further synchronous RPCs: the overdue request's callbacks are detached, requests queued behind it are discarded without being sent, and later synchronous calls raise the same `ChannelRpcTimeout`. Fire-and-forget methods that expect no reply still work, and `Channel.close()` meta-closes locally instead of sending `Channel.Close`, whose `Channel.CloseOk` could not be told apart from the late reply. The request had already reached the broker, so the operation may have taken effect there; the exception text says as much. Open a new channel and verify the outcome before retrying a non-idempotent operation.
 
 ## [1.4.4](https://github.com/pika/pika/tree/1.4.4) (2026-08-06)
 

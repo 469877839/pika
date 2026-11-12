@@ -92,8 +92,11 @@ class BlockingChannelTests(unittest.TestCase):
         self.channel_impl_mock.basic_cancel.assert_not_called()
         self.assertEqual([c[0] for c in events.mock_calls], ['reject', 'flush'])
         # Waiting on anything but "always ready" would never end: no reply is coming.
-        self.assertEqual(self.connection._flush_output.call_args[0][1:],
-                         self.obj._ALWAYS_READY_WAITERS)
+        # The RPC-deadline waiter precedes the always-ready one.
+        waiters = self.connection._flush_output.call_args[0][1:]
+        self.assertIsNone(self.obj._rpc_timeout_error)
+        self.assertFalse(waiters[0]())
+        self.assertEqual(waiters[1:], self.obj._ALWAYS_READY_WAITERS)
         self.assertEqual(len(self.obj._pending_events), 0)
 
     def test_basic_cancel_returns_a_broker_cancelled_auto_ack_consumers_messages(
@@ -190,3 +193,54 @@ class BlockingChannelTests(unittest.TestCase):
             self.obj.basic_consume('queue', mock.Mock())
             self.assertEqual(1, len(self.obj.consumer_tags))
             self.assertIn('ctag0', self.obj.consumer_tags)
+
+
+class BlockingChannelRpcDeadlineTests(BlockingChannelTests):
+    """How the blocking wrapper surfaces the impl channel's RPC deadline."""
+
+    def setUp(self):
+        super().setUp()
+        self.channel_impl_mock.channel_number = 1
+
+    def test_rpc_timeout_raises_channel_rpc_timeout_from_the_wait(self):
+        expiry = exceptions.ChannelRpcTimeout('stuck')
+
+        def expire_during_call(**_kwargs):
+            self.obj._on_rpc_timeout(self.channel_impl_mock, expiry)
+
+        self.channel_impl_mock.queue_declare.side_effect = expire_during_call
+
+        with self.assertRaises(exceptions.ChannelRpcTimeout) as ctx:
+            self.obj.queue_declare('q', deadline=1)
+        self.assertIs(ctx.exception, expiry)
+        self.assertIs(self.obj._rpc_timeout_error, expiry)
+
+    def test_deadline_is_forwarded_to_the_impl(self):
+        def deliver_reply(**kwargs):
+            kwargs['callback'](frame.Method(1, spec.Queue.DeclareOk(queue='q')))
+
+        self.channel_impl_mock.queue_declare.side_effect = deliver_reply
+        self.obj.queue_declare('q', deadline=2.5)
+        self.assertEqual(
+            self.channel_impl_mock.queue_declare.call_args.kwargs['deadline'],
+            2.5)
+
+    def test_no_deadline_is_forwarded_by_default(self):
+        def deliver_reply(**kwargs):
+            kwargs['callback'](frame.Method(1, spec.Queue.DeclareOk(queue='q')))
+
+        self.channel_impl_mock.queue_declare.side_effect = deliver_reply
+        self.obj.queue_declare('q')
+        self.assertIsNone(
+            self.channel_impl_mock.queue_declare.call_args.kwargs['deadline'])
+
+    def test_close_after_an_expiry_does_not_attempt_further_rpcs(self):
+        self.obj._rpc_timeout_error = exceptions.ChannelRpcTimeout('stuck')
+        self.obj._consumer_infos['ctag'] = mock.Mock()
+
+        self.obj.close()
+
+        # A cancel would itself be refused by the poisoned impl channel.
+        self.channel_impl_mock.basic_cancel.assert_not_called()
+        self.channel_impl_mock.close.assert_called_once_with(
+            reply_code=0, reply_text='Normal shutdown')
