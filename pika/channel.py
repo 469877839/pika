@@ -18,7 +18,7 @@ from pika.exchange_type import ExchangeType
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from pika import amqp_object
+    from pika import amqp_object, recovery
     from pika.connection import Connection
 
 LOGGER = logging.getLogger(__name__)
@@ -139,6 +139,10 @@ class Channel:
         # Deliveries dropped by `_on_deliver` because the channel was no longer
         # open, reported once on the transition to CLOSED.
         self._discarded_while_closing: int = 0
+
+        # Optional `ChannelRecoveryPlan` recording broker-confirmed topology for
+        # replay onto a new channel; None unless the caller attaches one.
+        self._recovery_plan: recovery.ChannelRecoveryPlan | None = None
 
     def __int__(self) -> int:
         """Return the channel object as its channel number."""
@@ -295,6 +299,32 @@ class Channel:
         """
         return self.callbacks.remove_matching(self.channel_number, '_on_return',
                                               lambda cb: cb == callback)
+
+    def set_recovery_plan(self,
+                          plan: recovery.ChannelRecoveryPlan | None) -> None:
+        """
+        Attach a [`ChannelRecoveryPlan`][pika.recovery.ChannelRecoveryPlan] that records the
+        exchange and queue declarations, queue bindings, QoS and consumers the broker confirms on
+        this channel, so the caller can replay them onto a new channel after a reconnect.
+
+        Only operations that complete are recorded: a nowait call and an unanswered call add
+        nothing. `queue_delete` and `basic_cancel` remove the matching records once the broker
+        confirms them. Pass ``None`` to detach without changing the plan's contents.
+
+        With a plan attached, a waited `queue_declare` of a name the plan already recorded
+        raises `ValueError` instead of sending, because a second declaration of the same name
+        cannot be replayed independently.
+
+        :param plan: The plan to record into, or ``None`` to detach
+        """
+        self._recovery_plan = plan
+
+    @property
+    def recovery_plan(self) -> recovery.ChannelRecoveryPlan | None:
+        """Return the attached [`ChannelRecoveryPlan`][pika.recovery.ChannelRecoveryPlan], or
+        ``None`` when no plan is attached.
+        """
+        return self._recovery_plan
 
     def basic_ack(self, delivery_tag: int = 0, multiple: bool = False) -> None:
         """
@@ -466,6 +496,16 @@ class Channel:
         rpc_callback: Callable[
             ...,
             Any] | None = self._on_eventok if callback is None else callback
+        if self._recovery_plan is not None:
+            rpc_callback = functools.partial(
+                self._on_recovery_consume_ok,
+                queue=queue,
+                on_message_callback=on_message_callback,
+                auto_ack=auto_ack,
+                exclusive=exclusive,
+                consumer_tag=consumer_tag,
+                arguments=arguments or {},
+                user_callback=rpc_callback)
 
         self._rpc(
             spec.Basic.Consume(queue=queue,
@@ -478,6 +518,18 @@ class Channel:
             })])
 
         return consumer_tag
+
+    def _on_recovery_consume_ok(
+            self, method_frame: frame.Method, queue: str,
+            on_message_callback: _OnMessageCallback, auto_ack: bool,
+            exclusive: bool, consumer_tag: str, arguments: dict[str, Any],
+            user_callback: Callable[..., Any] | None) -> None:
+        """Record a confirmed `Basic.Consume`, then run the caller's completion callback."""
+        assert self._recovery_plan is not None
+        self._recovery_plan.record_consume(queue, on_message_callback, auto_ack,
+                                           exclusive, consumer_tag, arguments)
+        if user_callback is not None:
+            user_callback(method_frame)
 
     def _generate_consumer_tag(self) -> str:
         """
@@ -641,9 +693,27 @@ class Channel:
         validators.rpc_completion_callback(callback)
         validators.zero_or_greater('prefetch_size', prefetch_size)
         validators.zero_or_greater('prefetch_count', prefetch_count)
+        if self._recovery_plan is not None and callback is not None:
+            user_callback = callback
+            callback = functools.partial(self._on_recovery_qos_ok,
+                                         prefetch_size=prefetch_size,
+                                         prefetch_count=prefetch_count,
+                                         global_qos=global_qos,
+                                         user_callback=user_callback)
         return self._rpc(
             spec.Basic.Qos(prefetch_size, prefetch_count, global_qos), callback,
             [spec.Basic.QosOk])
+
+    def _on_recovery_qos_ok(self, method_frame: frame.Method,
+                            prefetch_size: int, prefetch_count: int,
+                            global_qos: bool,
+                            user_callback: Callable[..., Any] | None) -> None:
+        """Record a confirmed `Basic.Qos`, then run the caller's completion callback."""
+        assert self._recovery_plan is not None
+        self._recovery_plan.record_qos(prefetch_size, prefetch_count,
+                                       global_qos)
+        if user_callback is not None:
+            user_callback(method_frame)
 
     def basic_reject(self, delivery_tag: int = 0, requeue: bool = True) -> None:
         """
@@ -867,11 +937,35 @@ class Channel:
         nowait = validators.rpc_completion_callback(callback)
         if isinstance(exchange_type, Enum):
             exchange_type = exchange_type.value
+        if self._recovery_plan is not None and not nowait:
+            callback = functools.partial(self._on_recovery_exchange_declare_ok,
+                                         exchange=exchange,
+                                         exchange_type=exchange_type,
+                                         passive=passive,
+                                         durable=durable,
+                                         auto_delete=auto_delete,
+                                         internal=internal,
+                                         arguments=arguments or {},
+                                         user_callback=callback)
         return self._rpc(
             spec.Exchange.Declare(0, exchange, exchange_type, passive, durable,
                                   auto_delete, internal, nowait, arguments or
                                   {}), callback,
             [spec.Exchange.DeclareOk] if not nowait else [])
+
+    def _on_recovery_exchange_declare_ok(
+            self, method_frame: frame.Method, exchange: str, exchange_type: str,
+            passive: bool, durable: bool, auto_delete: bool, internal: bool,
+            arguments: dict[str, Any],
+            user_callback: Callable[..., Any] | None) -> None:
+        """Record a confirmed `Exchange.Declare`, then run the caller's callback."""
+        assert self._recovery_plan is not None
+        self._recovery_plan.record_exchange_declare(exchange, exchange_type,
+                                                    passive, durable,
+                                                    auto_delete, internal,
+                                                    arguments)
+        if user_callback is not None:
+            user_callback(method_frame)
 
     def exchange_delete(
             self,
@@ -890,9 +984,23 @@ class Channel:
         """
         self._raise_if_not_open()
         nowait = validators.rpc_completion_callback(callback)
+        if self._recovery_plan is not None and not nowait:
+            callback = functools.partial(self._on_recovery_exchange_delete_ok,
+                                         exchange=exchange,
+                                         user_callback=callback)
         return self._rpc(spec.Exchange.Delete(0, exchange, if_unused,
                                               nowait), callback,
                          [spec.Exchange.DeleteOk] if not nowait else [])
+
+    def _on_recovery_exchange_delete_ok(
+            self, method_frame: frame.Method, exchange: str | None,
+            user_callback: Callable[..., Any] | None) -> None:
+        """Drop a deleted exchange's records once the broker confirms, then run the callback."""
+        assert self._recovery_plan is not None
+        if exchange is not None:
+            self._recovery_plan.forget_exchange(exchange)
+        if user_callback is not None:
+            user_callback(method_frame)
 
     def exchange_unbind(
             self,
@@ -992,10 +1100,28 @@ class Channel:
         nowait = validators.rpc_completion_callback(callback)
         if routing_key is None:
             routing_key = queue
+        if self._recovery_plan is not None and not nowait:
+            callback = functools.partial(self._on_recovery_queue_bind_ok,
+                                         queue=queue,
+                                         exchange=exchange,
+                                         routing_key=routing_key,
+                                         arguments=arguments or {},
+                                         user_callback=callback)
         return self._rpc(
             spec.Queue.Bind(0, queue, exchange, routing_key, nowait,
                             arguments or {}), callback,
             [spec.Queue.BindOk] if not nowait else [])
+
+    def _on_recovery_queue_bind_ok(
+            self, method_frame: frame.Method, queue: str, exchange: str,
+            routing_key: str, arguments: dict[str, Any],
+            user_callback: Callable[..., Any] | None) -> None:
+        """Record a confirmed `Queue.Bind`, then run the caller's callback."""
+        assert self._recovery_plan is not None
+        self._recovery_plan.record_queue_bind(queue, exchange, routing_key,
+                                              arguments)
+        if user_callback is not None:
+            user_callback(method_frame)
 
     def queue_declare(self,
                       queue: str,
@@ -1026,11 +1152,14 @@ class Channel:
         :returns: ``None``. Method frame from the Queue.Declare-ok response is
             delivered to ``callback`` when synchronous (no ok frame in nowait
             mode).
-        :raises ValueError:
+        :raises ValueError: if a recovery plan is attached and already records a declaration
+            of *queue*
         """
         validators.require_string(queue, 'queue')
         self._raise_if_not_open()
         nowait = validators.rpc_completion_callback(callback)
+        if self._recovery_plan is not None and not nowait:
+            self._recovery_plan._refuse_queue_name(queue)
 
         condition: Any
         if queue:
@@ -1039,10 +1168,35 @@ class Channel:
             condition = spec.Queue.DeclareOk
         replies = [condition] if not nowait else []
 
+        if self._recovery_plan is not None and not nowait:
+            callback = functools.partial(self._on_recovery_queue_declare_ok,
+                                         queue=queue,
+                                         passive=passive,
+                                         durable=durable,
+                                         exclusive=exclusive,
+                                         auto_delete=auto_delete,
+                                         arguments=arguments or {},
+                                         user_callback=callback)
+
         return self._rpc(
             spec.Queue.Declare(0, queue, passive, durable, exclusive,
                                auto_delete, nowait, arguments or {}), callback,
             replies)
+
+    def _on_recovery_queue_declare_ok(
+            self, method_frame: frame.Method, queue: str, passive: bool,
+            durable: bool, exclusive: bool, auto_delete: bool,
+            arguments: dict[str, Any],
+            user_callback: Callable[..., Any] | None) -> None:
+        """Record a confirmed `Queue.Declare`, then run the caller's callback."""
+        assert self._recovery_plan is not None
+        actual_name = method_frame.method.queue
+        assert isinstance(actual_name, str)
+        self._recovery_plan.record_queue_declare(queue, passive, durable,
+                                                 exclusive, auto_delete,
+                                                 arguments, actual_name)
+        if user_callback is not None:
+            user_callback(method_frame)
 
     def queue_delete(self,
                      queue: str,
@@ -1064,9 +1218,25 @@ class Channel:
         validators.require_string(queue, 'queue')
         nowait = validators.rpc_completion_callback(callback)
         replies = [spec.Queue.DeleteOk] if not nowait else []
+        if self._recovery_plan is not None and not nowait:
+            callback = functools.partial(self._on_recovery_queue_delete_ok,
+                                         queue=queue,
+                                         user_callback=callback)
         return self._rpc(
             spec.Queue.Delete(0, queue, if_unused, if_empty, nowait), callback,
             replies)
+
+    def _on_recovery_queue_delete_ok(
+            self, method_frame: frame.Method, queue: str,
+            user_callback: Callable[..., Any] | None) -> None:
+        """Drop a deleted queue's records once the broker confirms, then run the callback."""
+        assert self._recovery_plan is not None
+        # An empty name means the most recent server-named queue, so resolve it
+        # before the record lookup, which only matches concrete names.
+        self._recovery_plan.forget_queue(
+            self._recovery_plan._resolve_queue_name(queue) or queue)
+        if user_callback is not None:
+            user_callback(method_frame)
 
     def queue_purge(self,
                     queue: str,
@@ -1304,6 +1474,8 @@ class Channel:
             # User-initiated cancel is waiting for Cancel-ok
             return
 
+        if self._recovery_plan is not None:
+            self._recovery_plan.forget_consumer(consumer_tag)
         self._cleanup_consumer_ref(consumer_tag)
 
     def _on_cancelok(self, method_frame: frame.Method,
@@ -1314,7 +1486,10 @@ class Channel:
         :param method_frame: The method frame received
         :param callback: The caller's `basic_cancel` callback, run once the consumer is retired
         """
-        self._cleanup_consumer_ref(method_frame.method.consumer_tag)
+        consumer_tag = method_frame.method.consumer_tag
+        if self._recovery_plan is not None:
+            self._recovery_plan.forget_consumer(consumer_tag)
+        self._cleanup_consumer_ref(consumer_tag)
         callback(method_frame)
 
     def _transition_to_closed(self) -> None:

@@ -140,6 +140,7 @@ nav:
       - Exceptions: modules/exceptions.md
       - Field Tables: modules/data.md
       - Parameters: modules/parameters.md
+      - Recovery Plan: modules/recovery.md
       - Specification: modules/spec.md
   - Examples:
       - Overview: examples.md
