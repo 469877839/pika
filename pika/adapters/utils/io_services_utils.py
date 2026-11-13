@@ -846,6 +846,7 @@ class _AsyncTransportBase(AbstractStreamTransport):
             self._nbio.remove_reader(self._sock.fileno())
             self._nbio.remove_writer(self._sock.fileno())
             self._tx_buffers.clear()
+            self._tx_buffered_byte_count = 0
 
     @_log_exceptions
     def _close_and_finalize(self) -> None:

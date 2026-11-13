@@ -55,6 +55,23 @@ class PlaintextTransportReadableTests(unittest.TestCase):
         self.protocol.connection_lost.assert_called_once_with(error)
 
 
+class TransportDeactivateTests(unittest.TestCase):
+
+    def test_deactivate_clears_buffered_byte_accounting(self):
+        """Aborting clears the count with the buffers it measures."""
+        sock = mock.Mock(spec=socket.socket)
+        sock.fileno.return_value = 1
+        transport = io_services_utils._AsyncPlaintextTransport(
+            sock, mock.Mock(), mock.Mock())
+        transport.write(b'frame')
+        self.assertEqual(transport.get_write_buffer_size(), 5)
+
+        transport._deactivate()
+
+        self.assertEqual(list(transport._tx_buffers), [])
+        self.assertEqual(transport.get_write_buffer_size(), 0)
+
+
 class TransportFailureIsLoggedOnceTests(unittest.TestCase):
 
     def readable_failure_records(self, transport_class, sock):
