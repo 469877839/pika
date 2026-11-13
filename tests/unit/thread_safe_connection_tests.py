@@ -4826,5 +4826,354 @@ class ChannelOpenExceptionPathTests(_ConnectionHarness, unittest.TestCase):
         self.assertIs(ctx.exception, boom)
 
 
+class DeadIOLoopThreadTests(_ConnectionHarness, unittest.TestCase):
+    """What each close/RPC wait does once the IOLoop thread is gone.
+
+    `_run_ioloop` catches `Exception`, records the close reason and wakes every blocked caller, so
+    an ordinary callback exception terminates every wait here.  A `BaseException` (user code raising
+    `SystemExit` or `KeyboardInterrupt` in an IOLoop-thread callback) escapes that handler: the
+    thread dies with `_closed_reason` unset and nothing left that can set it.  Each test parks the
+    call on a daemon thread, proves the wait is still outstanding, then releases it by hand the way
+    the missing crash handler would have, so no test depends on a long sleep.
+    """
+
+    def _make_connection_with_controllable_ioloop(self):
+        """
+        A Connection whose mocked IOLoop blocks until `kill` raises inside it.
+
+        Returns ``(conn, mock_conn, mock_ioloop, kill)``.  ``kill(exc)`` makes ``ioloop.start()``
+        raise *exc* on the IOLoop thread and joins the thread, so the test continues with the
+        thread provably dead.
+        """
+        gate = threading.Event()
+        pending = []
+        with patch('pika.adapters.thread_safe_connection.SelectConnection'
+                  ) as MockSelectConn:
+            mock_conn = MagicMock()
+            mock_ioloop = MagicMock()
+            mock_conn.ioloop = mock_ioloop
+            mock_conn.is_open = True
+            mock_conn.is_closed = False
+            mock_conn.is_closing = False
+            # A healthy connection has no pending error; _submit_or_terminate
+            # short-circuits when _error is set, so it must be None here.
+            mock_conn._error = None
+
+            def fake_init(parameters, on_open_callback, on_open_error_callback,
+                          on_close_callback):
+                on_open_callback(mock_conn)
+                return mock_conn
+
+            MockSelectConn.side_effect = fake_init
+            MockSelectConn.return_value = mock_conn
+
+            def ioloop_start():
+                gate.wait(timeout=30)
+                if pending:
+                    raise pending[0]
+
+            mock_ioloop.start.side_effect = ioloop_start
+
+            conn = Connection(parameters='params')
+
+        def kill(exc):
+            pending.append(exc)
+            gate.set()
+            conn._ioloop_thread.join(timeout=5)
+            self.assertFalse(conn._ioloop_thread.is_alive())
+
+        def release_stray_ioloop():
+            if conn._ioloop_thread.is_alive():
+                kill(RuntimeError('test cleanup'))
+
+        self.addCleanup(release_stray_ioloop)
+        return conn, mock_conn, mock_ioloop, kill
+
+    @staticmethod
+    def _make_channel(conn):
+        """A wrapper Channel on *conn* with a mocked raw channel."""
+        raw_ch = MagicMock()
+        raw_ch.channel_number = 1
+        raw_ch.is_open = True
+        raw_ch.is_closed = False
+        raw_ch.is_closing = False
+        raw_ch._consumers = {}
+        raw_ch._cancelled = set()
+        return Channel(raw_ch, conn), raw_ch
+
+    @staticmethod
+    def _wait_for(predicate, timeout=5):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.01)
+        raise AssertionError(f'condition not met within {timeout} seconds')
+
+    @staticmethod
+    def _release_waiter(conn, index=0):
+        """Set the waiter's event the way `_run_ioloop`'s crash handler would have."""
+        event, error = conn._blocking_waiters[index]
+        error[0] = RuntimeError('test cleanup')
+        event.set()
+
+    def test_blocking_rpc_hangs_when_baseexception_kills_ioloop(self):
+        """A `_blocking_rpc` waiter registered before a `BaseException` kills the IOLoop thread is
+        never woken: the only code that completes these waiters without a broker reply is
+        `_run_ioloop`'s `except Exception` arm, which a `BaseException` bypasses.
+        """
+        conn, _mock_conn, _mock_ioloop, kill = (
+            self._make_connection_with_controllable_ioloop())
+        ch, _raw_ch = self._make_channel(conn)
+        box = {}
+        done = threading.Event()
+
+        def call():
+            try:
+                ch.queue_declare('q', timeout=None)
+            except BaseException as exc:
+                box['error'] = exc
+            finally:
+                done.set()
+
+        t = threading.Thread(target=call, daemon=True)
+        t.start()
+        self._wait_for(lambda: len(conn._blocking_waiters) == 1)
+
+        kill(SystemExit('simulated callback crash'))
+        self.assertIsNone(conn._closed_reason)
+
+        self.assertFalse(
+            done.wait(timeout=1),
+            'queue_declare(timeout=None) returned after the IOLoop thread died; '
+            'its completion signal died with the thread')
+        self.assertEqual(len(conn._blocking_waiters), 1)
+
+        self._release_waiter(conn)
+        self.assertTrue(done.wait(timeout=5))
+        self.assertIsInstance(box['error'], RuntimeError)
+
+    def test_blocking_rpc_is_woken_when_exception_kills_ioloop(self):
+        """The handled contrast: an `Exception` crash completes the same waiter with the reason."""
+        crash = RuntimeError('simulated callback crash')
+        conn, _mock_conn, _mock_ioloop, kill = (
+            self._make_connection_with_controllable_ioloop())
+        ch, _raw_ch = self._make_channel(conn)
+        box = {}
+        done = threading.Event()
+
+        def call():
+            try:
+                ch.queue_declare('q', timeout=None)
+            except BaseException as exc:
+                box['error'] = exc
+            finally:
+                done.set()
+
+        t = threading.Thread(target=call, daemon=True)
+        t.start()
+        self._wait_for(lambda: len(conn._blocking_waiters) == 1)
+
+        kill(crash)
+
+        self.assertTrue(
+            done.wait(timeout=5),
+            'queue_declare(timeout=None) must be woken by the crash handler')
+        self.assertIs(box['error'], crash)
+
+    def test_channel_close_hangs_after_baseexception_kills_ioloop(self):
+        """`Channel.close(timeout=None)` parks in `ready.wait(None)` for a Channel.CloseOk that can
+        never arrive: the quiesce phases are liveness-checked and complete, then the close is
+        scheduled on a dead IOLoop and the only wait without a liveness recheck hangs.
+        """
+        conn, _mock_conn, mock_ioloop, kill = (
+            self._make_connection_with_controllable_ioloop())
+        ch, raw_ch = self._make_channel(conn)
+        kill(SystemExit('simulated callback crash'))
+        box = {}
+        done = threading.Event()
+
+        def call():
+            try:
+                ch.close(timeout=None)
+            except BaseException as exc:
+                box['error'] = exc
+            finally:
+                done.set()
+
+        t = threading.Thread(target=call, daemon=True)
+        t.start()
+        # Two scheduled callbacks means the thread passed the quiesce
+        # (_cancel_all) and reached _close, i.e. it is parked in ready.wait.
+        self._wait_for(
+            lambda: mock_ioloop.add_callback_threadsafe.call_count >= 2)
+
+        self.assertFalse(
+            done.wait(timeout=1),
+            'close(timeout=None) returned after the IOLoop thread died; '
+            'nothing remains that can set its waiter')
+        raw_ch.close.assert_not_called()
+
+        self._release_waiter(conn)
+        self.assertTrue(done.wait(timeout=5))
+        self.assertIsInstance(box['error'], RuntimeError)
+
+    def test_channel_open_hangs_after_baseexception_kills_ioloop(self):
+        """`Connection.channel(timeout=None)` waits on the same unguarded event."""
+        conn, _mock_conn, _mock_ioloop, kill = (
+            self._make_connection_with_controllable_ioloop())
+        kill(SystemExit('simulated callback crash'))
+        box = {}
+        done = threading.Event()
+
+        def call():
+            try:
+                conn.channel(timeout=None)
+            except BaseException as exc:
+                box['error'] = exc
+            finally:
+                done.set()
+
+        t = threading.Thread(target=call, daemon=True)
+        t.start()
+        self._wait_for(lambda: len(conn._blocking_waiters) == 1)
+
+        self.assertFalse(
+            done.wait(timeout=1),
+            'channel(timeout=None) returned after the IOLoop thread died')
+
+        self._release_waiter(conn)
+        self.assertTrue(done.wait(timeout=5))
+        self.assertIsInstance(box['error'], RuntimeError)
+
+    def test_connection_close_after_baseexception_crash_records_no_reason(self):
+        """`Connection.close()` on the dead connection returns promptly but records nothing: the
+        close is scheduled on a dead IOLoop, the join is of a dead thread, and the force path that
+        records a reason is skipped because the thread is not alive.  The connection keeps
+        reporting open, so every later RPC is accepted and hangs.
+        """
+        conn, mock_conn, _mock_ioloop, kill = (
+            self._make_connection_with_controllable_ioloop())
+        kill(SystemExit('simulated callback crash'))
+
+        start = time.monotonic()
+        conn.close(timeout=None)
+        self.assertLess(time.monotonic() - start, 5)
+
+        mock_conn.close.assert_not_called()
+        self.assertIsNone(conn._closed_reason)
+        self.assertTrue(conn.is_open)
+        self.assertFalse(conn._connection_pool_shutdown)
+
+    def test_init_hangs_when_baseexception_kills_ioloop_before_open(self):
+        """`Connection(timeout=None)` waits on `_connected_event`, which only the open callback,
+        the open-error callback or the `except Exception` crash handler sets; a `BaseException`
+        before open sets none of them.
+        """
+        captured = {}
+        with patch('pika.adapters.thread_safe_connection.SelectConnection'
+                  ) as MockSelectConn:
+            mock_conn = MagicMock()
+            mock_ioloop = MagicMock()
+            mock_conn.ioloop = mock_ioloop
+
+            def fake_init(parameters, on_open_callback, on_open_error_callback,
+                          on_close_callback):
+                captured['on_open'] = on_open_callback
+                return mock_conn
+
+            MockSelectConn.side_effect = fake_init
+            MockSelectConn.return_value = mock_conn
+            mock_ioloop.start.side_effect = SystemExit(
+                'simulated callback crash')
+
+            box = {}
+            done = threading.Event()
+
+            def call():
+                try:
+                    box['conn'] = Connection(parameters='params', timeout=None)
+                except BaseException as exc:
+                    box['error'] = exc
+                finally:
+                    done.set()
+
+            t = threading.Thread(target=call, daemon=True)
+            t.start()
+
+            self.assertFalse(
+                done.wait(timeout=1),
+                'Connection(timeout=None) returned although the IOLoop thread '
+                'died before the connection opened')
+
+            # Release the constructor through the open callback, the only
+            # remaining setter of _connected_event.
+            captured['on_open'](mock_conn)
+            self.assertTrue(done.wait(timeout=5))
+            self.assertIn('conn', box)
+
+    def test_confirm_lock_outlives_a_hung_confirm_delivery(self):
+        """A `confirm_delivery(timeout=None)` parked on the dead IOLoop holds `_confirm_lock`
+        forever, so a later `confirm_delivery` blocks on the lock and its own finite timeout never
+        starts.
+        """
+        conn, _mock_conn, _mock_ioloop, kill = (
+            self._make_connection_with_controllable_ioloop())
+        ch, _raw_ch = self._make_channel(conn)
+        kill(SystemExit('simulated callback crash'))
+        first_done = threading.Event()
+
+        def first():
+            try:
+                ch.confirm_delivery(lambda _frame: None, timeout=None)
+            except BaseException:
+                pass
+            finally:
+                first_done.set()
+
+        t1 = threading.Thread(target=first, daemon=True)
+        t1.start()
+        self._wait_for(lambda: len(conn._blocking_waiters) == 1)
+
+        box = {}
+        second_done = threading.Event()
+
+        def second():
+            try:
+                ch.confirm_delivery(lambda _frame: None, timeout=0.01)
+            except BaseException as exc:
+                box['error'] = exc
+            finally:
+                second_done.set()
+
+        t2 = threading.Thread(target=second, daemon=True)
+        t2.start()
+
+        self.assertFalse(
+            second_done.wait(timeout=1),
+            'the second confirm_delivery returned; its 0.01 s timeout cannot '
+            'start while the first caller holds _confirm_lock forever')
+
+        self._release_waiter(conn)
+        self.assertTrue(first_done.wait(timeout=5))
+        self.assertTrue(second_done.wait(timeout=5))
+        self.assertIsInstance(box['error'], TimeoutError)
+
+    def test_quiesce_phases_return_after_ioloop_death(self):
+        """The cancel and drain phases are liveness-checked: with a live consumer registered and
+        the IOLoop thread dead, `_quiesce` returns instead of waiting for a CancelOk that can never
+        arrive.
+        """
+        conn, _mock_conn, _mock_ioloop, kill = (
+            self._make_connection_with_controllable_ioloop())
+        ch, raw_ch = self._make_channel(conn)
+        raw_ch._consumers = {'ctag1': object()}
+        kill(SystemExit('simulated callback crash'))
+
+        start = time.monotonic()
+        ch._quiesce(None)
+        self.assertLess(time.monotonic() - start, 5)
+
+
 if __name__ == '__main__':
     unittest.main()
