@@ -279,6 +279,33 @@ class ConsumerCancelled(AMQPChannelError):
         return f'{self.__class__.__name__}: Server cancelled consumer'
 
 
+class SynchronousRpcTimeout(AMQPChannelError):
+    """A synchronous channel RPC did not get its reply within the
+    `rpc_timeout` given to the `BlockingChannel` method.
+
+    .. attribute:: maybe_applied
+
+        `True` when the request had already been sent to the broker, so the
+        operation may have taken effect server-side despite the timeout; the
+        late reply is paired with this request when it arrives and cannot
+        complete a later RPC. `False` when the request was still queued
+        behind another synchronous RPC and was withdrawn unsent, so the
+        broker never saw it.
+    """
+
+    def __init__(self, maybe_applied: bool) -> None:
+        """
+        :param maybe_applied: whether the timed-out request had been sent to
+            the broker
+        """
+        self.maybe_applied = maybe_applied
+        super().__init__(
+            'the request was sent, so the operation may have taken effect '
+            'on the broker' if maybe_applied else
+            'the request was never sent, so the operation did not take '
+            'effect on the broker')
+
+
 class UnroutableError(AMQPChannelError):
     """
     Exception containing one or more unroutable messages returned by broker via Basic.Return.
