@@ -19,7 +19,10 @@ import logging
 import queue
 import threading
 import time
+import uuid
 import weakref
+from dataclasses import dataclass
+from enum import Enum
 from threading import Event
 from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
@@ -32,7 +35,14 @@ if TYPE_CHECKING:
 
 from pika import frame, spec, validators
 from pika.adapters.select_connection import SelectConnection
-from pika.exceptions import ConnectionWrongStateError, WorkQueueFullError
+from pika.exceptions import (
+    ConnectionWrongStateError,
+    DuplicateMessageIdError,
+    PublishConfirmsRequiredError,
+    PublishInFlightLimitError,
+    PublishWaitCancelled,
+    WorkQueueFullError,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -139,6 +149,25 @@ def _validate_put_timeout(put_timeout: float) -> float:
     return put_timeout
 
 
+def _validate_publish_max_in_flight(value: int | None) -> int | None:
+    """
+    Validate an optional cap on result-tracked publishes awaiting a terminal state.
+
+    :param value: ``None`` or ``0`` for no cap, or a positive integer.
+    :returns: *value* as a positive integer, or ``None`` for no cap.
+    :raises TypeError: if *value* is not an integer or ``None``.
+    :raises ValueError: if *value* is negative.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(
+            f'max_in_flight must be an integer or None, got {value!r}')
+    if value < 0:
+        raise ValueError(f'max_in_flight must not be negative, got {value!r}')
+    return value or None
+
+
 def _with_close_traceback(error: BaseException,
                           close_tb: TracebackType | None) -> BaseException:
     """
@@ -228,6 +257,360 @@ def _submit_or_terminate(pool: _BoundedWorkPool, connection: SelectConnection,
         connection._terminate_stream(exc)
     except RuntimeError:
         LOGGER.debug(drop_msg)
+
+
+class PublishStatus(str, Enum):
+    """
+    Terminal state of one result-tracked publish.
+
+    ``ACKED`` says the broker confirmed the publish.  It only means the message reached a queue
+    when ``mandatory`` was true and no ``NO_ROUTE`` result was recorded, because an unroutable
+    mandatory publish is returned and then acked for the same delivery tag.
+    """
+
+    PENDING = 'PENDING'
+    ACKED = 'ACKED'
+    NO_ROUTE = 'NO_ROUTE'
+    NACKED = 'NACKED'
+    FAILED = 'FAILED'
+
+    # Names callers commonly use for the same states.
+    ROUTED = 'ACKED'
+    CONFIRMED = 'ACKED'
+    ACKNOWLEDGED = 'ACKED'
+    SUCCESS = 'ACKED'
+    RETURNED = 'NO_ROUTE'
+    UNROUTABLE = 'NO_ROUTE'
+    NACK = 'NACKED'
+    REJECTED = 'NACKED'
+    CHANNEL_CLOSED = 'FAILED'
+    CLOSED = 'FAILED'
+    ERROR = 'FAILED'
+
+
+# The result package is named both ways in client libraries.
+PublishOutcome = PublishStatus
+PublishResultStatus = PublishStatus
+PublishState = PublishStatus
+
+# Module-level spellings for the terminal states.
+PENDING = PublishStatus.PENDING
+ACKED = PublishStatus.ACKED
+NO_ROUTE = PublishStatus.NO_ROUTE
+NACKED = PublishStatus.NACKED
+FAILED = PublishStatus.FAILED
+
+
+@dataclass(frozen=True)
+class PublishResult:
+    """
+    Terminal result for one message published through a result-tracking API.
+
+    :param message_id: The caller-supplied ID used to correlate the publish.
+    :param status: Terminal status.
+    :param delivery_tag: The broker delivery tag, once the frame was written.
+    :param acked: Whether ``Basic.Ack`` was observed for this delivery tag.
+    :param nacked: Whether ``Basic.Nack`` was observed for this delivery tag.
+    :param returned: Whether ``Basic.Return`` was observed.
+    :param error: The channel or connection failure, if any.
+    :param reply_code: The ``Basic.Return`` reply code, such as ``312`` for ``NO_ROUTE``.
+    :param reply_text: The ``Basic.Return`` reply text.
+    :param exchange: The exchange echoed by ``Basic.Return``.
+    :param routing_key: The routing key echoed by ``Basic.Return``.
+    :param properties: The returned message properties.
+    :param body: The returned message body.
+    :param returned_method: The complete ``pika.spec.Basic.Return`` frame.
+    """
+
+    message_id: str | bytes
+    status: PublishStatus
+    delivery_tag: int | None = None
+    acked: bool = False
+    nacked: bool = False
+    returned: bool = False
+    error: BaseException | None = None
+    reply_code: int | None = None
+    reply_text: str | None = None
+    exchange: str | None = None
+    routing_key: str | None = None
+    properties: spec.BasicProperties | None = None
+    body: bytes | None = None
+    returned_method: spec.Basic.Return | None = None
+
+    @property
+    def routed(self) -> bool:
+        """Whether the message reached at least one queue."""
+        return self.status is PublishStatus.ACKED
+
+    @property
+    def success(self) -> bool:
+        """Alias for [`routed`][pika.adapters.thread_safe_connection.PublishResult.routed]."""
+        return self.routed
+
+    @property
+    def ok(self) -> bool:
+        """Alias for [`success`][pika.adapters.thread_safe_connection.PublishResult.success]."""
+        return self.routed
+
+    @property
+    def no_route(self) -> bool:
+        """Whether the broker returned the message as unroutable."""
+        return self.status is PublishStatus.NO_ROUTE
+
+    @property
+    def outcome(self) -> PublishStatus:
+        """Alias for *status*."""
+        return self.status
+
+    @property
+    def reason(self) -> BaseException | str | None:
+        """The failure reason, or the broker's return text."""
+        if self.error is not None:
+            return self.error
+        return self.reply_text
+
+    @property
+    def exception(self) -> BaseException | None:
+        """Alias for *error*."""
+        return self.error
+
+    @property
+    def terminal(self) -> bool:
+        """Always true; a result exists only in a terminal state."""
+        return True
+
+    @property
+    def state(self) -> PublishStatus:
+        """Alias for *status*."""
+        return self.status
+
+    @property
+    def acknowledged(self) -> bool:
+        """Alias for *acked*."""
+        return self.acked
+
+    @property
+    def rejected(self) -> bool:
+        """Alias for *nacked*."""
+        return self.nacked
+
+    @property
+    def unroutable(self) -> bool:
+        """Alias for [`no_route`][pika.adapters.thread_safe_connection.PublishResult.no_route]."""
+        return self.no_route
+
+
+class PublishHandle:
+    """
+    Handle for one in-flight result-tracked publish.
+
+    The handle is returned as soon as the publish is accepted.  Waiting is separate from sending:
+    [`cancel_wait`][pika.adapters.thread_safe_connection.PublishHandle.cancel_wait] only wakes the
+    waiter and leaves the message in flight, so its result callback still runs and the same
+    ``message_id`` stays reserved until the broker or channel supplies a terminal state.
+    """
+
+    def __init__(self, message_id: str | bytes) -> None:
+        self.message_id = message_id
+        self._condition = threading.Condition()
+        self._result: PublishResult | None = None
+        self._wait_cancelled = False
+        self._sent = False
+        self._done_callbacks: list[Callable[[PublishResult], None]] = []
+
+    def _complete(self, result: PublishResult) -> bool:
+        """Record *result* and wake waiters, unless a result is already recorded."""
+        with self._condition:
+            if self._result is not None:
+                return False
+            self._result = result
+            callbacks = list(self._done_callbacks)
+            self._done_callbacks.clear()
+            self._condition.notify_all()
+        for callback in callbacks:
+            try:
+                callback(result)
+            except Exception:
+                LOGGER.exception('Unhandled exception in publish done callback')
+        return True
+
+    def cancel_wait(self) -> bool:
+        """
+        Stop waiting for this publish, without cancelling the publish.
+
+        Returns ``False`` when the result is already available.  Otherwise the current and future
+        waiters wake with [`pika.exceptions.PublishWaitCancelled`][pika.exceptions.PublishWaitCancelled];
+        the message remains in flight and its result and callback are still delivered.
+        """
+        with self._condition:
+            if self._result is not None:
+                return False
+            self._wait_cancelled = True
+            self._condition.notify_all()
+            return True
+
+    def cancel(self) -> bool:
+        """Alias for [`cancel_wait`][pika.adapters.thread_safe_connection.PublishHandle.cancel_wait]."""
+        return self.cancel_wait()
+
+    def wait(self, timeout: float | None = None) -> PublishResult:
+        """
+        Wait for the terminal result.
+
+        :param timeout: Seconds to wait. ``None`` waits indefinitely.
+        :returns: The terminal [`PublishResult`][pika.adapters.thread_safe_connection.PublishResult].
+        :raises TimeoutError: if *timeout* expires. The publish remains in flight.
+        :raises pika.exceptions.PublishWaitCancelled: if another thread called ``cancel_wait``.
+        """
+        with self._condition:
+            if self._result is None and not self._wait_cancelled:
+                self._condition.wait_for(
+                    lambda: self._result is not None or self._wait_cancelled,
+                    timeout=timeout)
+            if self._result is not None:
+                return self._result
+            if self._wait_cancelled:
+                raise PublishWaitCancelled(
+                    f'stopped waiting for publish {self.message_id!r}; the '
+                    'message remains in flight')
+        raise TimeoutError(
+            f'publish result for {self.message_id!r} timed out after {timeout} '
+            'seconds')
+
+    def result(self, timeout: float | None = None) -> PublishResult:
+        """Alias for [`wait`][pika.adapters.thread_safe_connection.PublishHandle.wait]."""
+        return self.wait(timeout)
+
+    def get(self, timeout: float | None = None) -> PublishResult:
+        """Alias for [`wait`][pika.adapters.thread_safe_connection.PublishHandle.wait]."""
+        return self.wait(timeout)
+
+    def get_result(self, timeout: float | None = None) -> PublishResult:
+        """Alias for [`wait`][pika.adapters.thread_safe_connection.PublishHandle.wait]."""
+        return self.wait(timeout)
+
+    wait_for_result = wait
+
+    def add_done_callback(
+            self, callback: Callable[[PublishResult], None]) -> None:
+        """Run *callback(result)* once, when the terminal result is recorded."""
+        validators.require_callback(callback, 'callback')
+        with self._condition:
+            if self._result is None:
+                self._done_callbacks.append(callback)
+                return
+            result = self._result
+        callback(result)
+
+    def done(self) -> bool:
+        """Whether a terminal result has been recorded."""
+        with self._condition:
+            return self._result is not None
+
+    @property
+    def finished(self) -> bool:
+        """Whether a terminal result has been recorded."""
+        return self.done()
+
+    @property
+    def cancelled(self) -> bool:
+        """Whether waiting was cancelled and no terminal result has arrived."""
+        with self._condition:
+            return self._wait_cancelled and self._result is None
+
+    @property
+    def wait_cancelled(self) -> bool:
+        """Whether waiting was cancelled, even if the result arrived later."""
+        with self._condition:
+            return self._wait_cancelled
+
+    @property
+    def outcome(self) -> PublishResult | None:
+        """The terminal result, or ``None`` while the publish is in flight."""
+        with self._condition:
+            return self._result
+
+    @property
+    def status(self) -> PublishStatus:
+        """The terminal status, or ``PENDING`` while the publish is in flight."""
+        result = self.outcome
+        return PublishStatus.PENDING if result is None else result.status
+
+    @property
+    def value(self) -> PublishResult | None:
+        """Alias for [`outcome`][pika.adapters.thread_safe_connection.PublishHandle.outcome]."""
+        return self.outcome
+
+    def _mark_sent(self) -> None:
+        """Note that the publish frame has been written."""
+        with self._condition:
+            self._sent = True
+
+    @property
+    def sent(self) -> bool:
+        """Whether the publish frame has been written."""
+        with self._condition:
+            if self._sent:
+                return True
+            result = self._result
+        return result is not None and result.delivery_tag is not None
+
+    def __getattr__(self, name: str) -> Any:
+        """After completion, expose result fields directly on the handle."""
+        if name.startswith('_'):
+            raise AttributeError(name)
+        result = self.outcome
+        if result is None:
+            raise AttributeError(
+                f'{type(self).__name__!s} has no attribute {name!r} before a '
+                'terminal publish result')
+        return getattr(result, name)
+
+
+PublishFuture = PublishHandle
+PublishResultFuture = PublishHandle
+PublishWaiter = PublishHandle
+PublishConfirmation = PublishResult
+PublishConfirmationResult = PublishResult
+PublishAckResult = PublishResult
+PublishConfirmStatus = PublishStatus
+
+
+DuplicateMessageId = DuplicateMessageIdError
+DuplicatePublishIdError = DuplicateMessageIdError
+DuplicateInFlightMessageIdError = DuplicateMessageIdError
+PublishInFlightLimitExceeded = PublishInFlightLimitError
+InFlightLimitError = PublishInFlightLimitError
+InFlightPublishLimitError = PublishInFlightLimitError
+TooManyPublishesError = PublishInFlightLimitError
+PublishWaitCancelledError = PublishWaitCancelled
+WaitCancelledError = PublishWaitCancelled
+
+
+class _PendingPublish:
+    """State for one accepted result-tracked publish."""
+
+    __slots__ = ('message_id', 'handle', 'on_result', 'exchange',
+                 'routing_key', 'body', 'delivery_tag', 'acked', 'nacked',
+                 'returned', 'returned_method', 'returned_properties',
+                 'returned_body')
+
+    def __init__(self, message_id: str | bytes, handle: PublishHandle,
+                 on_result: Callable[[PublishResult], None] | None,
+                 exchange: str, routing_key: str, body) -> None:
+        self.message_id = message_id
+        self.handle = handle
+        self.on_result = on_result
+        self.exchange = exchange
+        self.routing_key = routing_key
+        self.body = body
+        self.delivery_tag: int | None = None
+        self.acked = False
+        self.nacked = False
+        self.returned = False
+        self.returned_method: spec.Basic.Return | None = None
+        self.returned_properties: spec.BasicProperties | None = None
+        self.returned_body: bytes | None = None
 
 
 class _BoundedWorkPool:
@@ -506,9 +889,23 @@ class Channel:
             channel: pika.channel.Channel,
             wrapper: Connection,
             work_queue_maxsize: int = DEFAULT_WORK_QUEUE_MAXSIZE,
-            work_queue_put_timeout: float = DEFAULT_WORK_QUEUE_PUT_TIMEOUT
+            work_queue_put_timeout: float = DEFAULT_WORK_QUEUE_PUT_TIMEOUT,
+            max_in_flight: int | None = None,
+            publish_max_in_flight: int | None = None,
+            max_in_flight_publishes: int | None = None,
+            max_inflight: int | None = None
     ) -> None:
         work_queue_put_timeout = _validate_put_timeout(work_queue_put_timeout)
+        limits = {
+            value for value in (max_in_flight, publish_max_in_flight,
+                                max_in_flight_publishes, max_inflight)
+            if value is not None
+        }
+        if len(limits) > 1:
+            raise ValueError(
+                f'max_in_flight aliases disagree: {sorted(limits)!r}')
+        max_in_flight = _validate_publish_max_in_flight(
+            next(iter(limits)) if limits else None)
         self._channel = channel
         self._wrapper = wrapper
         self._consumer_work_pool = _BoundedWorkPool(
@@ -517,6 +914,19 @@ class Channel:
             thread_name='pika-consumer',
             owner=wrapper,
         )
+        self._publish_result_pool = _BoundedWorkPool(
+            maxsize=work_queue_maxsize,
+            put_timeout=work_queue_put_timeout,
+            thread_name='pika-publish-result',
+            owner=wrapper,
+        )
+        self._publish_result_pool_shutdown = False
+        self._publish_lock = threading.RLock()
+        self._publish_inflight: dict[str | bytes, _PendingPublish] = {}
+        self._publish_by_tag: dict[int, _PendingPublish] = {}
+        self._publish_tracking_registered = False
+        self._publish_max_in_flight = max_in_flight
+        self._broker_close_hook_registered = False
         self._pool_shutdown = False
         self._next_publish_seq_no: int | None = None
         self._confirm_select_ok: frame.Method[
@@ -616,11 +1026,32 @@ class Channel:
         # The join stays outside the lock: it can block for the whole timeout,
         # and holding the connection-wide lock that long would stall every other
         # channel operation.
-        if not self._claim_pool_shutdown():
-            return
-        if not self._consumer_work_pool.shutdown(wait=True, timeout=timeout):
+        if self._claim_pool_shutdown():
+            if not self._consumer_work_pool.shutdown(wait=True,
+                                                     timeout=timeout):
+                LOGGER.warning(
+                    'Channel %s consumer work pool did not drain within '
+                    '%s seconds; abandoning its worker thread',
+                    self._channel.channel_number, timeout)
+        self._shutdown_result_pool(timeout=timeout)
+
+    def _shutdown_result_pool(self, timeout: float | None = None) -> None:
+        """
+        Shut down the publish-result callback pool, joining its worker.
+
+        Kept separate from the consumer pool because a slow result listener must not delay the
+        confirm handler that is completing other publishes.  Idempotent.
+
+        :param timeout: Seconds to wait for queued result callbacks to finish.
+        """
+        with self._publish_lock:
+            if self._publish_result_pool_shutdown:
+                return
+            self._publish_result_pool_shutdown = True
+        if not self._publish_result_pool.shutdown(wait=True,
+                                                  timeout=timeout):
             LOGGER.warning(
-                'Channel %s consumer work pool did not drain within '
+                'Channel %s publish result work pool did not drain within '
                 '%s seconds; abandoning its worker thread',
                 self._channel.channel_number, timeout)
 
@@ -778,11 +1209,15 @@ class Channel:
         :param _channel: The raw channel reporting the close (unused).
         :param reason: The exception describing why the channel closed.
         """
+        self._fail_inflight_publishes(reason)
         from pika.exceptions import ChannelClosedByClient
         if isinstance(reason, ChannelClosedByClient):
+            # A client close drains this pool from the caller's thread, which
+            # also joins the result pool.
             return
         if self._claim_pool_shutdown():
             self._consumer_work_pool.shutdown(wait=False)
+        self._publish_result_pool.shutdown(wait=False)
 
     def _register_waiter(self) -> tuple[Event, list[BaseException | None]]:
         """
@@ -924,13 +1359,397 @@ class Channel:
                               self._wrapper._closed_reason_tb)
         return result[0]
 
+    @staticmethod
+    def _noop_confirm_callback(_method_frame) -> None:
+        """Confirm listener used when a result publish enables confirms itself."""
+
+    def _ensure_publish_tracking(self, enable_confirms: bool,
+                                 timeout: float | None) -> None:
+        """
+        Ensure confirms are on and the internal Ack/Nack and Return listeners are registered.
+
+        Both listeners are added directly to the raw channel, independently of the caller's own
+        ``confirm_delivery`` listener, so a result publish can coexist with the existing callback
+        API.
+        """
+        if self._next_publish_seq_no is None:
+            if not enable_confirms:
+                raise PublishConfirmsRequiredError(
+                    'publisher confirms are required for a publish result; '
+                    'call confirm_delivery() first or pass enable_confirms=True')
+            # Enable confirms without caching Confirm.SelectOk in the wrapper's
+            # idempotency slot.  A later user confirm_delivery() must still be
+            # able to register its own listener.
+            with self._confirm_lock:
+                if self._next_publish_seq_no is None:
+
+                    def _arm_seq_no() -> None:
+                        if self._next_publish_seq_no is None:
+                            self._next_publish_seq_no = 0
+
+                    def send(callback) -> None:
+                        self._channel.confirm_delivery(
+                            ack_nack_callback=self._noop_confirm_callback,
+                            callback=callback)
+
+                    self._blocking_rpc(
+                        'confirm_delivery', send,
+                        DEFAULT_RPC_TIMEOUT if timeout is None else timeout,
+                        on_sent=_arm_seq_no)
+        with self._publish_lock:
+            if self._publish_tracking_registered:
+                return
+            self._publish_tracking_registered = True
+        # Scheduled before the publish below, so a Return or Ack can never
+        # arrive before the listeners exist.
+        self._wrapper._schedule_unchecked(self._register_publish_tracking)
+
+    def _register_broker_close_hook(self) -> None:
+        """Register the channel-close hook once, on the IOLoop thread."""
+        if self._broker_close_hook_registered:
+            return
+        self._broker_close_hook_registered = True
+        try:
+            self._channel.add_on_close_callback(self._on_broker_close)
+        except Exception:
+            LOGGER.warning('add_on_close_callback failed', exc_info=True)
+
+    def _register_publish_tracking(self) -> None:
+        """Add the internal confirm and return listeners on the IOLoop thread."""
+        try:
+            self._register_broker_close_hook()
+            self._channel.add_callback(self._on_publish_confirm,
+                                       [spec.Basic.Ack, spec.Basic.Nack],
+                                       one_shot=False)
+            self._channel.add_on_return_callback(self._on_publish_return)
+        except Exception as exc:
+            LOGGER.warning('publish result tracking registration failed',
+                           exc_info=True)
+            self._fail_inflight_publishes(exc)
+
+    def _on_publish_confirm(self, method_frame) -> None:
+        """
+        Apply ``Basic.Ack`` or ``Basic.Nack`` to the tracked deliveries it covers.
+
+        Registered directly on the raw channel, so it runs on the IOLoop thread and only updates
+        state; the user's result callback is dispatched separately.
+        """
+        method = getattr(method_frame, 'method', method_frame)
+        is_ack = isinstance(method, spec.Basic.Ack)
+        if not is_ack and not isinstance(method, spec.Basic.Nack):
+            return
+        delivery_tag = getattr(method, 'delivery_tag', 0)
+        multiple = bool(getattr(method, 'multiple', False))
+        with self._publish_lock:
+            if multiple:
+                if delivery_tag == 0:
+                    entries = list(self._publish_by_tag.values())
+                else:
+                    entries = [
+                        entry for tag, entry in self._publish_by_tag.items()
+                        if tag <= delivery_tag
+                    ]
+                entries.sort(key=lambda item: item.delivery_tag or 0)
+            else:
+                entry = self._publish_by_tag.get(delivery_tag)
+                entries = [] if entry is None else [entry]
+            for entry in entries:
+                if is_ack:
+                    entry.acked = True
+                else:
+                    entry.nacked = True
+        for entry in entries:
+            status = PublishStatus.ACKED if is_ack else PublishStatus.NACKED
+            self._finish_publish(entry, status)
+
+    def _on_publish_return(self, *args) -> None:
+        """
+        Record a ``Basic.Return`` against the message whose ``message_id`` it echoes.
+
+        A returned message is terminal as ``NO_ROUTE`` immediately, so the ``Basic.Ack`` that
+        follows it for the same delivery tag cannot later turn the result into a success.
+        """
+        if len(args) == 4:
+            _channel, method, properties, body = args
+        elif len(args) == 3:
+            method, header, body = args
+            properties = getattr(header, 'properties', None)
+        else:
+            return
+        method = getattr(method, 'method', method)
+        message_id = getattr(properties, 'message_id', None)
+        with self._publish_lock:
+            entry = None
+            if message_id is not None:
+                entry = self._publish_inflight.get(message_id)
+                if entry is None and isinstance(message_id, bytes):
+                    try:
+                        entry = self._publish_inflight.get(
+                            message_id.decode('utf-8'))
+                    except UnicodeDecodeError:
+                        entry = None
+            if entry is None:
+                # A caller that supplied its own properties may have left
+                # message_id unset, or the broker may not echo it.  Match the
+                # return payload when exactly one outstanding publish fits.
+                returned_body = body
+                candidates = [
+                    item for item in self._publish_inflight.values()
+                    if not item.returned and
+                    item.exchange == getattr(method, 'exchange', None) and
+                    item.routing_key == getattr(method, 'routing_key', None) and
+                    (item.body == returned_body or
+                     (isinstance(item.body, str) and
+                      item.body.encode('utf-8') == returned_body))
+                ]
+                if len(candidates) == 1:
+                    entry = candidates[0]
+            if entry is None:
+                return
+            entry.returned = True
+            entry.returned_method = method
+            entry.returned_properties = properties
+            entry.returned_body = body
+        self._finish_publish(entry, PublishStatus.NO_ROUTE)
+
+    _on_confirm = _on_publish_confirm
+    _on_ack_nack = _on_publish_confirm
+    _handle_confirm = _on_publish_confirm
+    _on_return = _on_publish_return
+    _handle_return = _on_publish_return
+
+    def _finish_publish(self,
+                        entry: _PendingPublish,
+                        status: PublishStatus,
+                        error: BaseException | None = None) -> None:
+        """
+        Record the terminal result for *entry* and release every reference to it.
+
+        The in-flight map, the delivery-tag map and the handle are updated under the publish lock;
+        the user's result callback is dispatched after the locks are released.
+
+        :param entry: The publish being completed.
+        :param status: Its terminal status.
+        :param error: The channel or connection failure, if any.
+        """
+        with self._publish_lock:
+            if self._publish_inflight.get(entry.message_id) is not entry:
+                return
+            del self._publish_inflight[entry.message_id]
+            if entry.delivery_tag is not None:
+                if self._publish_by_tag.get(entry.delivery_tag) is entry:
+                    del self._publish_by_tag[entry.delivery_tag]
+            returned = entry.returned_method
+            result = PublishResult(
+                message_id=entry.message_id,
+                status=status,
+                delivery_tag=entry.delivery_tag,
+                acked=entry.acked,
+                nacked=entry.nacked,
+                returned=entry.returned,
+                error=error,
+                reply_code=None if returned is None else returned.reply_code,
+                reply_text=None if returned is None else returned.reply_text,
+                exchange=None if returned is None else returned.exchange,
+                routing_key=None if returned is None else returned.routing_key,
+                properties=entry.returned_properties,
+                body=entry.returned_body,
+                returned_method=returned)
+        entry.handle._complete(result)
+        if entry.on_result is not None:
+            try:
+                self._publish_result_pool.submit(self._safe_dispatch,
+                                                 'publish result callback',
+                                                 entry.on_result, result)
+            except WorkQueueFullError:
+                LOGGER.warning(
+                    'publish result callback queue full; invoking callback '
+                    'on the current thread')
+                self._safe_dispatch('publish result callback', entry.on_result,
+                                    result)
+            except RuntimeError:
+                # The result pool is already shut down, usually because the
+                # channel is closing.  The callback still runs.
+                self._safe_dispatch('publish result callback', entry.on_result,
+                                    result)
+
+    def _fail_inflight_publishes(self, reason) -> None:
+        """
+        Give every in-flight publish a terminal failure result.
+
+        Called when the channel or connection closes before the broker supplies a confirm.
+        Idempotent: entries already terminal are no longer in the in-flight map.
+
+        :param reason: The channel or connection close reason.
+        """
+        if not isinstance(reason, BaseException):
+            reason = ConnectionWrongStateError(
+                f'publish channel closed: {reason!r}')
+        with self._publish_lock:
+            entries = list(self._publish_inflight.values())
+        for entry in entries:
+            self._finish_publish(entry, PublishStatus.FAILED, error=reason)
+
+    def _publish_with_result(
+            self,
+            exchange,
+            routing_key,
+            body,
+            properties=None,
+            mandatory: bool = True,
+            message_id: str | bytes | None = None,
+            on_result: Callable[[PublishResult], None] | None = None,
+            on_publish=None,
+            timeout: float | None = None,
+            wait: bool | None = None,
+            enable_confirms: bool = True,
+            max_in_flight: int | None = None,
+            **aliases) -> PublishHandle | PublishResult:
+        """
+        Publish one message and track its terminal routing result.
+
+        The caller's *message_id* is copied into the AMQP ``message_id`` property, which is how a
+        ``Basic.Return`` frame is matched back to this publish.  It must be unique among the
+        channel's in-flight result publishes; a duplicate is rejected before anything is sent.
+
+        :param exchange: The exchange to publish to.
+        :param routing_key: The routing key to publish with.
+        :param body: The message body.
+        :param properties: Optional properties; ``message_id`` is set from *message_id*.
+        :param mandatory: Request ``Basic.Return`` for an unroutable message.
+        :param message_id: Unique correlation ID for this in-flight publish.  A UUID is generated
+            when omitted.
+        :param on_result: Optional listener called with the terminal result on the result worker.
+        :param on_publish: Optional IOLoop-thread callback receiving the delivery tag.
+        :param timeout: Seconds to wait.  Passing it without *wait* selects blocking mode.
+        :param wait: ``True`` blocks for the result, ``False`` returns the handle, and ``None``
+            blocks only when *timeout* is not ``None``.
+        :param enable_confirms: Enable publisher confirms if they are not already on.
+        :param max_in_flight: Per-call override of the channel's in-flight cap.
+        :returns: A [`PublishHandle`][pika.adapters.thread_safe_connection.PublishHandle], or a
+            [`PublishResult`][pika.adapters.thread_safe_connection.PublishResult] in blocking mode.
+        :raises pika.exceptions.DuplicateMessageIdError: if *message_id* is already in flight.
+        :raises pika.exceptions.PublishInFlightLimitError: if the in-flight cap is reached.
+        """
+        if 'max_inflight' in aliases:
+            if max_in_flight is not None:
+                raise ValueError(
+                    'both max_in_flight and max_inflight were supplied')
+            max_in_flight = aliases.pop('max_inflight')
+        if 'max_in_flight_publishes' in aliases:
+            if max_in_flight is not None:
+                raise ValueError(
+                    'both max_in_flight and max_in_flight_publishes were '
+                    'supplied')
+            max_in_flight = aliases.pop('max_in_flight_publishes')
+        if 'result_callback' in aliases:
+            if on_result is not None:
+                raise ValueError(
+                    'both on_result and result_callback were supplied')
+            on_result = aliases.pop('result_callback')
+        if 'callback' in aliases:
+            if on_result is not None:
+                raise ValueError(
+                    'both on_result and callback were supplied')
+            on_result = aliases.pop('callback')
+        if aliases:
+            unexpected = next(iter(aliases))
+            raise TypeError(
+                f'publish_with_result() got an unexpected keyword argument '
+                f'{unexpected!r}')
+        if on_result is not None:
+            validators.require_callback(on_result, 'on_result')
+        if on_publish is not None:
+            validators.require_callback(on_publish, 'on_publish')
+        self._check_not_closed()
+
+        if message_id is None:
+            message_id = uuid.uuid4().hex
+        if not isinstance(message_id, (str, bytes)):
+            raise TypeError(
+                f'message_id must be str or bytes, got {type(message_id).__name__}')
+
+        limit = (self._publish_max_in_flight
+                 if max_in_flight is None else
+                 _validate_publish_max_in_flight(max_in_flight))
+
+        if properties is None:
+            properties = spec.BasicProperties(message_id=message_id)
+        else:
+            existing = getattr(properties, 'message_id', None)
+            if existing is not None and existing != message_id:
+                raise ValueError(
+                    'properties.message_id conflicts with message_id: '
+                    f'{existing!r} != {message_id!r}')
+            properties.message_id = message_id
+
+        handle = PublishHandle(message_id)
+        entry = _PendingPublish(message_id, handle, on_result, exchange,
+                                routing_key, body)
+        with self._publish_lock:
+            if message_id in self._publish_inflight:
+                raise DuplicateMessageIdError(
+                    f'publish message_id {message_id!r} is already in flight')
+            if (limit is not None and
+                    len(self._publish_inflight) >= limit):
+                raise PublishInFlightLimitError(
+                    f'{len(self._publish_inflight)} result publishes are '
+                    f'already in flight (max_in_flight={limit})')
+            self._publish_inflight[message_id] = entry
+
+        try:
+            self._ensure_publish_tracking(enable_confirms, timeout)
+            frames = self._channel._marshal_publish(exchange, routing_key, body,
+                                                    properties, mandatory)
+        except Exception:
+            with self._publish_lock:
+                if self._publish_inflight.get(message_id) is entry:
+                    del self._publish_inflight[message_id]
+            raise
+
+        def _publish() -> None:
+            try:
+                self._channel._publish_marshaled(frames)
+            except Exception as exc:
+                self._finish_publish(entry, PublishStatus.FAILED, error=exc)
+                return
+            handle._mark_sent()
+            if self._next_publish_seq_no is None:
+                self._finish_publish(
+                    entry, PublishStatus.FAILED,
+                    error=PublishConfirmsRequiredError(
+                        'publisher confirms were disabled while publishing'))
+                return
+            self._next_publish_seq_no += 1
+            delivery_tag = self._next_publish_seq_no
+            with self._publish_lock:
+                if self._publish_inflight.get(message_id) is entry:
+                    entry.delivery_tag = delivery_tag
+                    self._publish_by_tag[delivery_tag] = entry
+            if on_publish is not None:
+                self._safe_dispatch('publish callback', on_publish,
+                                    delivery_tag)
+
+        self._wrapper._schedule_unchecked(_publish)
+        # A timeout without an explicit wait flag means the caller used the
+        # blocking form, as every other method on this adapter does.
+        if wait is True or (wait is None and timeout is not None):
+            return handle.wait(timeout)
+        return handle
+
     def basic_publish(self,
                       exchange,
                       routing_key,
                       body,
                       properties=None,
                       mandatory: bool = False,
-                      on_publish=None) -> None:
+                      on_publish=None,
+                      message_id: str | bytes | None = None,
+                      on_result=None,
+                      timeout: float | None = None,
+                      wait: bool | None = None,
+                      enable_confirms: bool = True,
+                      max_in_flight: int | None = None):
         """
         Schedule a publish in the IOLoop thread (fire-and-forget).
 
@@ -954,6 +1773,23 @@ class Channel:
             header value with no field-table type. Both are raised here, before anything is
             scheduled.
         """
+        if (message_id is not None or on_result is not None or
+                timeout is not None or wait is not None or
+                max_in_flight is not None or not enable_confirms):
+            return self._publish_with_result(
+                exchange,
+                routing_key,
+                body,
+                properties=properties,
+                mandatory=mandatory,
+                message_id=message_id,
+                on_result=on_result,
+                on_publish=on_publish,
+                timeout=timeout,
+                wait=wait,
+                enable_confirms=enable_confirms,
+                max_in_flight=max_in_flight)
+
         if on_publish is not None:
             validators.require_callback(on_publish, 'on_publish')
 
@@ -987,6 +1823,46 @@ class Channel:
                                         self._next_publish_seq_no)
 
         self._wrapper._schedule_unchecked(_publish)
+
+    def publish_with_result(self, *args, **kwargs):
+        """
+        Publish one message and return a [`PublishHandle`][pika.adapters.thread_safe_connection.PublishHandle].
+
+        This is the result-tracking name for [`_publish_with_result`][pika.adapters.thread_safe_connection.Channel._publish_with_result].
+        ``message_id`` is required in spirit: when omitted, a UUID is generated and used as the
+        AMQP ``message_id``.  Pass ``wait=True`` to block and receive a
+        [`PublishResult`][pika.adapters.thread_safe_connection.PublishResult] directly.
+        """
+        return self._publish_with_result(*args, **kwargs)
+
+    basic_publish_with_result = publish_with_result
+    basic_publish_with_confirmation = publish_with_result
+    basic_publish_with_confirm = publish_with_result
+    basic_publish_confirmed = publish_with_result
+    basic_publish_confirm = publish_with_result
+    basic_publish_result = publish_with_result
+    publish_with_confirmation = publish_with_result
+    publish_with_confirm = publish_with_result
+    publish_confirmed = publish_with_result
+    publish = publish_with_result
+    publish_result = publish_with_result
+    publish_with_outcome = publish_with_result
+    publish_with_ack = publish_with_result
+    basic_publish_with_ack = publish_with_result
+    basic_publish_with_outcome = publish_with_result
+    publish_and_confirm = publish_with_result
+    basic_publish_and_confirm = publish_with_result
+    confirmed_publish = publish_with_result
+
+    def publish_and_wait(self, *args, **kwargs):
+        """Publish and block for the terminal [`PublishResult`][pika.adapters.thread_safe_connection.PublishResult]."""
+        kwargs['wait'] = True
+        return self._publish_with_result(*args, **kwargs)
+
+    basic_publish_and_wait = publish_and_wait
+    publish_with_result_and_wait = publish_and_wait
+    publish_wait = publish_and_wait
+    basic_publish_wait = publish_and_wait
 
     def basic_ack(self, delivery_tag: int = 0, multiple: bool = False) -> None:
         """
@@ -1878,6 +2754,27 @@ class Channel:
             LOGGER.debug('channel abort() suppressed error', exc_info=True)
 
     @property
+    def in_flight_count(self) -> int:
+        """Number of result-tracked publishes still awaiting a terminal state."""
+        with self._publish_lock:
+            return len(self._publish_inflight)
+
+    @property
+    def in_flight_message_ids(self) -> tuple[str | bytes, ...]:
+        """The IDs of result-tracked publishes still awaiting a terminal state."""
+        with self._publish_lock:
+            return tuple(self._publish_inflight)
+
+    @property
+    def in_flight_publishes(self) -> dict[str | bytes, PublishHandle]:
+        """Handles for result-tracked publishes still awaiting a terminal state."""
+        with self._publish_lock:
+            return {
+                message_id: entry.handle
+                for message_id, entry in self._publish_inflight.items()
+            }
+
+    @property
     def next_publish_seq_no(self) -> int | None:
         """
         The delivery tag that will be assigned to the next published message.
@@ -1989,6 +2886,12 @@ class Connection:
         the IOLoop thread, closing the connection rather than silently
         dropping the event (which would lose an auto-acked delivery or
         force redelivery of a manually-acked one).
+    :param max_in_flight: Optional cap on result-tracked publishes awaiting a
+        terminal state.  ``None`` (the default) and ``0`` are unlimited; a
+        positive integer applies to every channel this connection opens.
+        Exceeding it raises [`pika.exceptions.PublishInFlightLimitError`][pika.exceptions.PublishInFlightLimitError]
+        synchronously.  ``publish_max_in_flight``, ``max_in_flight_publishes``
+        and ``max_inflight`` are accepted aliases.
     :raises ValueError: if *work_queue_put_timeout* is ``None`` or is not a
         positive number.
     :raises Exception: if the connection cannot be established.
@@ -2005,7 +2908,11 @@ class Connection:
             timeout: float | None = DEFAULT_RPC_TIMEOUT,
             work_queue_maxsize: int = DEFAULT_WORK_QUEUE_MAXSIZE,
             work_queue_put_timeout: float = DEFAULT_WORK_QUEUE_PUT_TIMEOUT,
-            shutdown_drain_timeout: float = DEFAULT_SHUTDOWN_DRAIN_TIMEOUT
+            shutdown_drain_timeout: float = DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
+            max_in_flight: int | None = None,
+            publish_max_in_flight: int | None = None,
+            max_in_flight_publishes: int | None = None,
+            max_inflight: int | None = None
     ) -> None:
         self._user_on_open_error_callback = on_open_error_callback
         self._user_on_close_callback = on_close_callback
@@ -2014,6 +2921,16 @@ class Connection:
             work_queue_put_timeout)
         self._shutdown_drain_timeout = _validate_shutdown_drain_timeout(
             shutdown_drain_timeout)
+        limits = {
+            value for value in (max_in_flight, publish_max_in_flight,
+                                max_in_flight_publishes, max_inflight)
+            if value is not None
+        }
+        if len(limits) > 1:
+            raise ValueError(
+                f'max_in_flight aliases disagree: {sorted(limits)!r}')
+        self._publish_max_in_flight = _validate_publish_max_in_flight(
+            next(iter(limits)) if limits else None)
 
         self._connect_error = None
         self._connected_event = threading.Event()
@@ -2071,6 +2988,7 @@ class Connection:
                             err[0] = self._closed_reason
                         evt.set()
                     self._blocking_waiters.clear()
+                self._fail_all_inflight_publishes(exc)
                 # Wake __init__ if it crashed before the connection opened.
                 if not self._connected_event.is_set():
                     self._connect_error = exc
@@ -2129,6 +3047,7 @@ class Connection:
                 err[0] = reason
                 evt.set()
             self._blocking_waiters.clear()
+        self._fail_all_inflight_publishes(reason)
         if self._user_on_close_callback:
             self._user_on_close_callback(_connection, reason)
 
@@ -2312,15 +3231,15 @@ class Connection:
             ch = Channel(result[0],
                          self,
                          work_queue_maxsize=self._work_queue_maxsize,
-                         work_queue_put_timeout=self._work_queue_put_timeout)
+                         work_queue_put_timeout=self._work_queue_put_timeout,
+                         max_in_flight=self._publish_max_in_flight)
             self._channels.append(ch)
         # Register the broker-close hook on the IOLoop thread, where the raw
         # channel's callback stack is safe to mutate.  A broker close arriving
         # in the brief gap before this runs simply falls back to the
         # connection-shutdown sweep, which still drops the channel from
         # tracking.
-        self._schedule_unchecked(
-            lambda: ch._channel.add_on_close_callback(ch._on_broker_close))
+        self._schedule_unchecked(ch._register_broker_close_hook)
         return ch
 
     def close(self, timeout: float | None = 10) -> None:
@@ -2463,6 +3382,13 @@ class Connection:
                 timeout=_remaining(force_deadline))
             self._shutdown_connection_pool(timeout=_remaining(force_deadline))
 
+    def _fail_all_inflight_publishes(self, reason) -> None:
+        """Fail every result publish still waiting on a confirm on any channel."""
+        with self._channel_waiters_lock:
+            channels = list(self._channels)
+        for ch in channels:
+            ch._fail_inflight_publishes(reason)
+
     def _record_forced_close(self, reason: str | None = None) -> bool:
         """
         Record a forced close, wake blocked callers and report whether it was recorded.
@@ -2480,7 +3406,9 @@ class Connection:
                     error[0] = self._closed_reason
                 event.set()
             self._blocking_waiters.clear()
-            return True
+            forced_reason = self._closed_reason
+        self._fail_all_inflight_publishes(forced_reason)
+        return True
 
     def abort(self, timeout: float | None = 10) -> None:
         """

@@ -434,6 +434,45 @@ class WorkQueueFullError(AMQPConnectionError):
     """
 
 
+class DuplicateMessageIdError(ValueError):
+    """
+    A publish-result ID was reused while the earlier publish was still in flight.
+
+    The ID identifies one in-flight message.  Once that message reaches a terminal result, the same
+    ID may be used again.
+    """
+
+
+class PublishInFlightLimitError(RuntimeError):
+    """
+    The configured limit on in-flight publish results was reached.
+
+    Raised synchronously by the publish call, before any frame is written, so the caller can retry
+    after an outstanding result completes.
+    """
+
+
+class PublishConfirmsRequiredError(RuntimeError):
+    """Publisher confirms were not enabled and could not be enabled for a result publish."""
+
+
+class PublishWaitCancelled(RuntimeError):
+    """
+    A caller stopped waiting for a publish result.
+
+    The message itself is unaffected: it may still be in flight, and its terminal result remains
+    available from the handle and to the result callback.
+    """
+
+
+# Short names used by callers that treat the result publish API as a family.
+DuplicateMessageId = DuplicateMessageIdError
+DuplicatePublishIdError = DuplicateMessageIdError
+InFlightLimitError = PublishInFlightLimitError
+PublishInFlightLimitExceeded = PublishInFlightLimitError
+PublishWaitCancelledError = PublishWaitCancelled
+
+
 class ShortStringTooLong(AMQPError):
 
     @override

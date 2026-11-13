@@ -9,6 +9,11 @@ logging.getLogger(__name__).addHandler(logging.NullHandler())
 
 from pika import adapters, frame, spec
 from pika.adapters import BaseConnection, BlockingConnection, Connection, SelectConnection
+from pika.adapters.thread_safe_connection import (
+    PublishHandle,
+    PublishResult,
+    PublishStatus,
+)
 from pika.adapters.utils.connection_workflow import AMQPConnectionWorkflow
 from pika.connection import ConnectionParameters, SSLOptions, URLParameters
 from pika.credentials import PlainCredentials
@@ -24,6 +29,9 @@ __all__ = [
     'ConnectionParameters',
     'DeliveryMode',
     'PlainCredentials',
+    'PublishHandle',
+    'PublishResult',
+    'PublishStatus',
     'SSLOptions',
     'SelectConnection',
     'URLParameters',

@@ -74,6 +74,14 @@ The RabbitMQ Java and .NET clients run their confirm listener inline on the I/O 
 
 Idempotency also diverges from nothing: a second `confirm_delivery` on the same channel returns the cached `Confirm.SelectOk` without sending a frame or resetting the delivery-tag counter, which matches Java and .NET.
 
+## Result-tracked publishing
+
+**A Return is terminal on its own; the ack that follows it is not consulted for routing.** RabbitMQ writes Basic.Return and then Basic.Ack for the same sequence number when a mandatory publish is unroutable. The result tracker removes the in-flight entry when the return completes and drops the tag mapping, so the later ack cannot resurrect a routed success. It also means a lost ack after a return cannot keep the message_id reserved forever.
+
+**Cancelling a wait is not a publish operation.** `PublishHandle.cancel_wait` only wakes waiters; the in-flight entry, delivery-tag mapping, and result callback stay until the broker or channel closes. Removing the entry there would let a second publish reuse the ID while the first was still on the wire, and would make a cancellation look like a retraction of a frame already sent.
+
+**Result callbacks have their own worker and bounded queue.** Confirm processing runs on the IOLoop thread and must not run a slow listener inline. The callback is submitted to `_publish_result_pool`, while the handle's event is set first, so a slow listener cannot delay the terminal result or the next confirm. If that pool is already shut down, the callback runs on the current thread rather than being lost.
+
 ## Measurements
 
 Every figure below names its configuration, because none of them reproduces without one. `utils/measure_close_loss.py` reproduces the close figures against a live broker, taking the message count, body size, work-queue size, callback cost, timeout and acknowledgement mode as arguments. It is not wired into CI: a run takes as long as the callbacks it times, and it reports counts rather than a verdict. It discriminates between versions, which is how to tell it is measuring the close and not the harness: at 400 messages of 8 KiB with `--timeout none` it reports 339 of 400 lost on 1.4.x behaviour and none once the close drains first.

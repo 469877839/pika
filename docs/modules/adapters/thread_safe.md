@@ -34,6 +34,36 @@ for i in range(5):
 conn.close()
 ```
 
+## Publishing with a routing result
+
+`basic_publish` reports only that the frame was written. A broker `Basic.Ack` confirms receipt, not routing: a mandatory publish with no matching binding is returned as `Basic.Return` and then acked for the same delivery tag. When the business question is "did this message reach a queue", use `publish_with_result`:
+
+```python
+handle = ch.publish_with_result(
+    exchange='events',
+    routing_key='orders.created',
+    body=b'{"id": 1}',
+    properties=pika.BasicProperties(content_type='application/json'),
+    message_id='order-1-created',
+    mandatory=True,
+    on_result=lambda result: LOGGER.info('%s: %s', result.message_id,
+                                         result.status),
+)
+
+# Later, or from another thread:
+result = handle.wait(timeout=10)
+if result.status is pika.adapters.thread_safe_connection.PublishStatus.NO_ROUTE:
+    ...
+```
+
+The caller's `message_id` is copied into the AMQP `message_id` property and is the correlation key for `Basic.Return`. It must be unique among that channel's result-tracked publishes still awaiting a terminal state; reusing one raises `pika.exceptions.DuplicateMessageIdError` before anything is sent. Once the publish is terminal, the ID can be reused.
+
+`publish_with_result` returns a `PublishHandle`. `wait`/`result` block for the terminal `PublishResult`; `on_result` receives the same object on a separate worker thread, so a slow result listener does not delay confirm processing or another publish's handle. Passing `timeout` without `wait` selects the blocking form, as the other adapter methods do; `wait=True` blocks indefinitely. `handle.cancel_wait()` wakes waiters with `pika.exceptions.PublishWaitCancelled` but leaves the message in flight: the result callback and the terminal result are still delivered, and the `message_id` stays reserved. A `wait` timeout behaves the same way.
+
+The terminal status is one of `ACKED`, `NO_ROUTE`, `NACKED`, or `FAILED`. `NO_ROUTE` wins over the ack that follows it, so an unroutable mandatory message is never reported as routed. `Basic.Ack` with `multiple=True` completes every tracked tag up to and including its delivery tag, including tag `0`, which means all outstanding tags. A channel or connection close fails every publish still awaiting a confirm with the close reason.
+
+Pass `max_in_flight` to the `Connection` or `Channel` constructor, or to a single publish call, to cap result-tracked messages awaiting a terminal state. Exceeding the cap raises `pika.exceptions.PublishInFlightLimitError` synchronously, before a frame is written. `basic_publish` keeps its existing fire-and-forget behavior; adding `message_id`, `on_result`, `timeout`, or `wait` to it selects the result-tracking path.
+
 ## Consumer threading model
 
 The `on_message_callback` registered with `basic_consume` is dispatched on a per-channel worker thread. This means:
