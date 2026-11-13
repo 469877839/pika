@@ -9,15 +9,19 @@ import unittest
 import weakref
 from unittest.mock import ANY, MagicMock, patch
 
+from pika import callback as pika_callback
 from pika import exceptions, frame, spec
 from pika.adapters.thread_safe_connection import (
     _CLOSE_HANDSHAKE_FLOOR,
+    DEFAULT_RPC_TIMEOUT,
     DEFAULT_WORK_QUEUE_PUT_TIMEOUT,
     Channel,
     Connection,
+    PublishStatus,
     _BoundedWorkPool,
     _reraisable,
     _submit_or_terminate,
+    _validate_max_inflight_publishes,
     _validate_shutdown_drain_timeout,
     _with_close_traceback,
 )
@@ -27,6 +31,9 @@ from pika.exceptions import (
     AMQPConnectionError,
     ConnectionClosedByClient,
     ConnectionWrongStateError,
+    InFlightPublishLimitError,
+    PublishWaitCancelled,
+    StreamLostError,
     WorkQueueFullError,
 )
 
@@ -4824,6 +4831,518 @@ class ChannelOpenExceptionPathTests(_ConnectionHarness, unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             conn.channel(timeout=0.5)
         self.assertIs(ctx.exception, boom)
+
+
+class PublishWithResultHarness:
+    """
+    Build a wrapper `Channel` over a real `pika.channel.Channel` with no broker.
+
+    The raw channel keeps its real `CallbackManager` and content-frame assembler, so injecting a
+    `Basic.Return`/header/body sequence or dispatching a `Basic.Ack` exercises the same code paths
+    a broker frame would.  The connection is a `MagicMock` whose socket-facing members are pinned;
+    nothing is opened, connected or sent across a network.
+    """
+
+    CHANNEL_NUMBER = 1
+
+    def _make(self, max_inflight_publishes=0):
+        conn = MagicMock()
+        conn.callbacks = pika_callback.CallbackManager()
+        conn.publisher_confirms = True
+        conn.basic_nack = True
+        conn._error = None
+        conn._body_max_length = 131072 - 8
+
+        raw_ch = _AsyncChannel(conn, self.CHANNEL_NUMBER, MagicMock())
+        raw_ch._add_callbacks()
+        raw_ch._set_state(raw_ch.OPEN)
+
+        wrapper = MagicMock()
+        wrapper._closed_reason = None
+        wrapper._closed_reason_tb = None
+        wrapper._channel_waiters_lock = threading.Lock()
+        wrapper._blocking_waiters = []
+        wrapper._connection = conn
+        wrapper._channels = []
+
+        # Run every scheduled IOLoop callback inline, like a healthy loop
+        # would, but on the calling thread for determinism.
+        wrapper._schedule_unchecked.side_effect = lambda cb: cb()
+
+        ch = Channel(raw_ch,
+                     wrapper,
+                     max_inflight_publishes=max_inflight_publishes)
+        return ch, raw_ch, conn, wrapper
+
+    def _publish(self, ch, message_id='m1', body=b'hello',
+                 exchange='ex', routing_key='rk', properties=None,
+                 on_result=None):
+        return ch.publish_with_result(message_id=message_id,
+                                      exchange=exchange,
+                                      routing_key=routing_key,
+                                      body=body,
+                                      properties=properties,
+                                      on_result=on_result)
+
+    def _inject_select_ok(self, raw_ch, conn):
+        """Drive the Confirm.SelectOk reply the wrapper's RPC is waiting on."""
+        conn.callbacks.process(self.CHANNEL_NUMBER,
+                               spec.Confirm.SelectOk, raw_ch,
+                               frame.Method(self.CHANNEL_NUMBER,
+                                            spec.Confirm.SelectOk()))
+
+    def _inject_confirm(self, raw_ch, conn, delivery_tag, multiple=False,
+                        ack=True):
+        method = (spec.Basic.Ack(delivery_tag, multiple) if ack else
+                  spec.Basic.Nack(delivery_tag, multiple))
+        conn.callbacks.process(self.CHANNEL_NUMBER,
+                               method, raw_ch,
+                               frame.Method(self.CHANNEL_NUMBER, method))
+
+    def _inject_return(self, raw_ch, message_id, body=b'hello',
+                       reply_code=spec.NO_ROUTE, reply_text='NO_ROUTE',
+                       exchange='ex', routing_key='rk'):
+        """
+        Feed the real method/header/body frame sequence of a Basic.Return
+        through the raw channel's content-frame assembler, as the broker would.
+        """
+        props = spec.BasicProperties(message_id=message_id)
+        raw_ch._handle_content_frame(
+            frame.Method(self.CHANNEL_NUMBER,
+                         spec.Basic.Return(reply_code=reply_code,
+                                          reply_text=reply_text,
+                                          exchange=exchange,
+                                          routing_key=routing_key)))
+        raw_ch._handle_content_frame(
+            frame.Header(self.CHANNEL_NUMBER, len(body), props))
+        raw_ch._handle_content_frame(
+            frame.Body(self.CHANNEL_NUMBER, body))
+
+    def _close_channel(self, raw_ch, reason=None):
+        reason = reason or StreamLostError('connection lost')
+        raw_ch._on_close_meta(reason)
+
+    def _start_publish_backgrounded(self, ch, *args, **kwargs):
+        """
+        Run a publish (which blocks on Confirm.SelectOk) on another thread so
+        the test can drive SelectOk and the publish frame.
+        """
+        outcome: list = []
+
+        def run():
+            try:
+                outcome.append(('ok', self._publish(ch, *args, **kwargs)))
+            except BaseException as exc:  # capture any failure for the test
+                outcome.append(('error', exc))
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        return thread, outcome
+
+    def _enable_confirms(self, ch, raw_ch, conn):
+        """Enable confirms synchronously by driving SelectOk from the test thread."""
+        outcome: list = []
+
+        def run():
+            outcome.append(ch._enable_confirms(None, DEFAULT_RPC_TIMEOUT))
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 2
+        while raw_ch._on_ack_nack_callback is None and time.monotonic() < deadline:
+            time.sleep(0.001)
+        self.assertIsNotNone(raw_ch._on_ack_nack_callback)
+        self._inject_select_ok(raw_ch, conn)
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        return outcome[0]
+
+
+class PublishWithResultValidationTests(PublishWithResultHarness,
+                                       unittest.TestCase):
+    """Input validation and in-flight bookkeeping that needs no broker frames."""
+
+    def test_rejects_non_string_and_empty_message_id(self):
+        for bad in (None, 1, b'm1', ''):
+            with self.subTest(bad=bad):
+                ch2, _raw, _conn, _w = self._make()
+                with self.assertRaises(
+                        TypeError if not isinstance(bad, str) else
+                        ValueError):
+                    self._publish(ch2, message_id=bad)
+
+    def test_rejects_non_mandatory_publish(self):
+        ch, _raw, _conn, _wrapper = self._make()
+        with self.assertRaises(ValueError):
+            ch.publish_with_result(message_id='m1',
+                                   exchange='e',
+                                   routing_key='r',
+                                   body=b'x',
+                                   mandatory=False)
+
+    def test_rejects_mismatched_properties_message_id(self):
+        ch, _raw, _conn, _wrapper = self._make()
+        props = spec.BasicProperties(message_id='other')
+        with self.assertRaises(ValueError):
+            self._publish(ch, message_id='m1', properties=props)
+
+    def test_rejects_duplicate_in_flight_id(self):
+        ch, raw, conn, wrapper = self._make()
+        self._enable_confirms(ch, raw, conn)
+        first = self._publish(ch, message_id='dup')
+        self.assertIn('dup', ch._inflight_by_id)
+        with self.assertRaises(ValueError):
+            self._publish(ch, message_id='dup')
+        # The refused publish never reached the raw channel.
+        self.assertEqual(conn._send_method.call_count, 1)
+        self.assertIs(ch._inflight_by_id['dup'].result, first)
+
+    def test_inflight_cap_raises_before_writing_a_frame(self):
+        ch, raw, conn, _wrapper = self._make(max_inflight_publishes=1)
+        self._enable_confirms(ch, raw, conn)
+        first = self._publish(ch, message_id='one')
+        self.assertIn('one', ch._inflight_by_id)
+        with self.assertRaises(InFlightPublishLimitError):
+            self._publish(ch, message_id='two')
+        self.assertEqual(conn._send_method.call_count, 1)
+        # Completing the first frees the slot.  The first publish got tag 1.
+        self._inject_confirm(raw, conn, 1)
+        self.assertEqual(len(ch._inflight_by_id), 0)
+        self._publish(ch, message_id='two')
+        self.assertIn('two', ch._inflight_by_id)
+
+    def test_limit_validation_rejects_invalid_values(self):
+        for bad in (-1, 1.5, True, None):
+            with self.subTest(bad=bad):
+                with self.assertRaises((TypeError, ValueError)):
+                    _validate_max_inflight_publishes(bad)
+
+    def test_connection_rejects_invalid_inflight_limit_before_connecting(self):
+        """Validation runs ahead of SelectConnection construction, so no broker or patching is
+        involved.
+        """
+        for bad, error in ((-1, ValueError), (1.5, TypeError), (True, TypeError),
+                           (None, TypeError)):
+            with self.subTest(bad=bad):
+                with self.assertRaises(error):
+                    Connection(parameters='params',
+                               max_inflight_publishes=bad)
+
+    def test_properties_without_message_id_get_a_copied_id(self):
+        ch, raw, conn, _wrapper = self._make()
+        self._enable_confirms(ch, raw, conn)
+        original = spec.BasicProperties(content_type='text/plain')
+        result = self._publish(ch, message_id='m1', properties=original)
+        self.assertIsNone(original.message_id)
+        self.assertEqual(
+            ch._inflight_by_id['m1'].result.message_id, result.message_id)
+
+    def test_alias_returns_same_callable(self):
+        self.assertIs(Channel.publish_with_result,
+                      Channel.basic_publish_with_result)
+
+
+class PublishWithResultFrameTests(PublishWithResultHarness, unittest.TestCase):
+    """Terminal states driven by real method/header/body frames, no broker."""
+
+    def _armed(self):
+        ch, raw, conn, wrapper = self._make()
+        self._enable_confirms(ch, raw, conn)
+        return ch, raw, conn, wrapper
+
+    def test_ack_alone_reports_routed_and_releases_everything(self):
+        ch, raw, conn, _wrapper = self._armed()
+        result = self._publish(ch, message_id='m1')
+        self.assertFalse(result.done)
+        self.assertIsNone(result.status)
+        self.assertEqual(len(ch._inflight_by_id), 1)
+        self.assertEqual(len(ch._inflight_by_tag), 1)
+
+        self._inject_confirm(raw, conn, 1)
+
+        self.assertTrue(result.done)
+        self.assertEqual(result.status, PublishStatus.ROUTED)
+        self.assertIsNone(result.reply_code)
+        self.assertIsNone(result.exception)
+        # Both registries released, and the wait returns the same handle.
+        self.assertEqual(ch._inflight_by_id, {})
+        self.assertEqual(ch._inflight_by_tag, {})
+        self.assertIs(result.wait(timeout=0), result)
+
+    def test_no_route_return_then_ack_reports_not_routed(self):
+        """
+        The frame sequence a live 4.x broker produced for an unroutable
+        mandatory publish - Basic.Return with NO_ROUTE, then Basic.Ack - must
+        end as NOT_ROUTED, not ROUTED.
+        """
+        ch, raw, conn, _wrapper = self._armed()
+        result = self._publish(ch, message_id='m1')
+
+        # Method + header + body, through the real content assembler.
+        self._inject_return(raw, 'm1')
+        self.assertFalse(result.done, 'a return alone is not terminal')
+        self.assertEqual(len(ch._inflight_by_id), 1)
+
+        self._inject_confirm(raw, conn, 1)  # the ack that follows
+
+        self.assertTrue(result.done)
+        self.assertEqual(result.status, PublishStatus.NOT_ROUTED)
+        self.assertNotEqual(result.status, PublishStatus.ROUTED)
+        self.assertEqual(result.reply_code, spec.NO_ROUTE)
+        self.assertEqual(result.reply_text, 'NO_ROUTE')
+        self.assertEqual(ch._inflight_by_id, {})
+        self.assertEqual(ch._inflight_by_tag, {})
+
+    def test_no_route_then_nack_reports_nacked_with_return_details(self):
+        ch, raw, conn, _wrapper = self._armed()
+        result = self._publish(ch, message_id='m1')
+        self._inject_return(raw, 'm1')
+        self._inject_confirm(raw, conn, 1, ack=False)
+        self.assertEqual(result.status, PublishStatus.NACKED)
+        self.assertEqual(result.reply_code, spec.NO_ROUTE)
+        self.assertEqual(ch._inflight_by_id, {})
+
+    def test_channel_close_fails_pending_as_channel_failed(self):
+        ch, raw, conn, _wrapper = self._armed()
+        result = self._publish(ch, message_id='m1')
+        reason = StreamLostError('connection lost')
+        self._close_channel(raw, reason)
+        self.assertTrue(result.done)
+        self.assertEqual(result.status, PublishStatus.CHANNEL_FAILED)
+        self.assertIs(result.exception, reason)
+        self.assertEqual(ch._inflight_by_id, {})
+        self.assertEqual(ch._inflight_by_tag, {})
+
+    def test_returned_then_channel_close_reports_not_routed(self):
+        ch, raw, conn, _wrapper = self._armed()
+        result = self._publish(ch, message_id='m1')
+        self._inject_return(raw, 'm1')
+        self._close_channel(raw)
+        self.assertEqual(result.status, PublishStatus.NOT_ROUTED)
+        self.assertEqual(result.reply_code, spec.NO_ROUTE)
+
+
+class PublishWithResultCancelAndCallbackTests(PublishWithResultHarness,
+                                              unittest.TestCase):
+    """Cancellation, timeouts, multiple confirms and result callbacks."""
+
+    def _armed(self):
+        ch, raw, conn, wrapper = self._make()
+        self._enable_confirms(ch, raw, conn)
+        return ch, raw, conn, wrapper
+
+    def test_multiple_ack_resolves_all_up_to_the_tag(self):
+        ch, raw, conn, _wrapper = self._armed()
+        results = [self._publish(ch, message_id=f'm{i}') for i in (1, 2, 3)]
+        self._inject_confirm(raw, conn, 2, multiple=True)
+        self.assertEqual(results[0].status, PublishStatus.ROUTED)
+        self.assertEqual(results[1].status, PublishStatus.ROUTED)
+        self.assertFalse(results[2].done)
+        self.assertEqual(list(ch._inflight_by_id), ['m3'])
+        self._inject_confirm(raw, conn, 3)
+        self.assertEqual(results[2].status, PublishStatus.ROUTED)
+        self.assertEqual(ch._inflight_by_id, {})
+
+    def test_multiple_ack_keeps_each_messages_return_state(self):
+        ch, raw, conn, _wrapper = self._armed()
+        first = self._publish(ch, message_id='m1')
+        second = self._publish(ch, message_id='m2')
+        self._inject_return(raw, 'm1')
+        self._inject_confirm(raw, conn, 2, multiple=True)
+        self.assertEqual(first.status, PublishStatus.NOT_ROUTED)
+        self.assertEqual(second.status, PublishStatus.ROUTED)
+
+    def test_ack_for_another_tag_does_not_resolve(self):
+        ch, raw, conn, _wrapper = self._armed()
+        result = self._publish(ch, message_id='m1')
+        self._inject_confirm(raw, conn, 99)
+        self.assertFalse(result.done)
+        self.assertEqual(len(ch._inflight_by_id), 1)
+
+    def test_wait_timeout_keeps_the_message_in_flight(self):
+        ch, raw, conn, _wrapper = self._armed()
+        result = self._publish(ch, message_id='m1')
+        with self.assertRaises(TimeoutError):
+            result.wait(timeout=0.01)
+        self.assertFalse(result.done)
+        self.assertEqual(len(ch._inflight_by_id), 1)
+        self._inject_confirm(raw, conn, 1)
+        self.assertIs(result.wait(timeout=0), result)
+        self.assertEqual(result.status, PublishStatus.ROUTED)
+
+    def test_cancel_wait_wakes_waiter_without_withdrawing_the_publish(self):
+        ch, raw, conn, _wrapper = self._armed()
+        result = self._publish(ch, message_id='m1')
+        outcome: list = []
+
+        def waiter():
+            try:
+                result.wait(timeout=None)
+            except BaseException as exc:
+                outcome.append(exc)
+
+        thread = threading.Thread(target=waiter, daemon=True)
+        thread.start()
+        # Give the waiter a moment to block, then cancel it from this thread.
+        time.sleep(0.05)
+        result.cancel_wait()
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(outcome), 1)
+        self.assertIsInstance(outcome[0], PublishWaitCancelled)
+        # Cancelling the wait did not withdraw the message: it is still
+        # tracked, and the broker's ack still produces a terminal result.
+        self.assertFalse(result.done)
+        self.assertEqual(len(ch._inflight_by_id), 1)
+        self._inject_confirm(raw, conn, 1)
+        self.assertEqual(result.status, PublishStatus.ROUTED)
+        self.assertEqual(ch._inflight_by_id, {})
+        # A second wait returns the recorded result rather than re-raising.
+        self.assertIs(result.wait(timeout=0), result)
+
+    def test_on_result_runs_on_the_worker_thread(self):
+        ch, raw, conn, _wrapper = self._armed()
+        seen: list = []
+
+        def on_result(result):
+            seen.append((threading.current_thread().name, result.status))
+
+        self._publish(ch, message_id='m1', on_result=on_result)
+        self._inject_confirm(raw, conn, 1)
+        deadline = time.monotonic() + 2
+        while not seen and time.monotonic() < deadline:
+            time.sleep(0.001)
+        ch._consumer_work_pool.shutdown(wait=True)
+        self.assertEqual(len(seen), 1)
+        self.assertIn('pika-consumer', seen[0][0])
+        self.assertEqual(seen[0][1], PublishStatus.ROUTED)
+
+    def test_on_result_exception_is_logged_and_contained(self):
+        ch, raw, conn, _wrapper = self._armed()
+
+        def boom(_result):
+            raise RuntimeError('result callback boom')
+
+        with self.assertLogs('pika.adapters.thread_safe_connection',
+                             level='ERROR') as cm:
+            self._publish(ch, message_id='m1', on_result=boom)
+            self._inject_confirm(raw, conn, 1)
+            ch._consumer_work_pool.shutdown(wait=True)
+        self.assertTrue(
+            any('publish result callback' in line for line in cm.output),
+            msg=f'expected the callback label, got {cm.output}')
+
+    def test_user_confirm_callback_still_receives_every_confirm(self):
+        """publish_with_result shares the raw channel's one ack listener, so a user callback
+        registered through confirm_delivery still sees the frames.
+        """
+        ch, raw, conn, _wrapper = self._make()
+        seen: list = []
+        confirm_thread, outcome = self._run_with_injection(
+            ch, lambda: ch.confirm_delivery(seen.append), raw, conn)
+        confirm_thread.join(2)
+        self.assertFalse(confirm_thread.is_alive())
+        self._publish(ch, message_id='m1')
+        self._inject_confirm(raw, conn, 1)
+        deadline = time.monotonic() + 2
+        while not seen and time.monotonic() < deadline:
+            time.sleep(0.001)
+        ch._consumer_work_pool.shutdown(wait=True)
+        self.assertEqual(len(seen), 1)
+        self.assertIsInstance(seen[0].method, spec.Basic.Ack)
+
+    def _run_with_injection(self, ch, call, raw, conn):
+        outcome: list = []
+
+        def run():
+            outcome.append(call())
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 2
+        while raw._on_ack_nack_callback is None and time.monotonic() < deadline:
+            time.sleep(0.001)
+        self.assertIsNotNone(raw._on_ack_nack_callback)
+        self._inject_select_ok(raw, conn)
+        return thread, outcome
+
+
+class PublishWithResultFailureTests(PublishWithResultHarness,
+                                     unittest.TestCase):
+    """Failure paths and resource release when a write or the transport fails."""
+
+    def _armed(self):
+        ch, raw, conn, wrapper = self._make()
+        self._enable_confirms(ch, raw, conn)
+        return ch, raw, conn, wrapper
+
+    def test_frame_write_failure_resolves_channel_failed_and_releases_slot(self):
+        from pika.exceptions import ChannelWrongStateError
+        ch, raw, conn, wrapper = self._armed()
+
+        def boom(_frames):
+            raise ChannelWrongStateError('channel closed')
+
+        conn._output_marshaled_frames.side_effect = boom
+        result = self._publish(ch, message_id='m1')
+        self.assertTrue(result.done)
+        self.assertEqual(result.status, PublishStatus.CHANNEL_FAILED)
+        self.assertIsInstance(result.exception, ChannelWrongStateError)
+        self.assertEqual(ch._inflight_by_id, {})
+        self.assertEqual(ch._inflight_by_tag, {})
+        # The failed slot frees capacity, and the message id can be reused.
+        conn._output_marshaled_frames.side_effect = None
+        again = self._publish(ch, message_id='m1')
+        self.assertFalse(again.done)
+        self.assertEqual(list(ch._inflight_by_id), ['m1'])
+
+    def test_publish_failure_under_cap_does_not_lose_the_slot_count(self):
+        from pika.exceptions import ChannelWrongStateError
+        ch, raw, conn, _wrapper = self._make(max_inflight_publishes=1)
+        self._enable_confirms(ch, raw, conn)
+        conn._output_marshaled_frames.side_effect = ChannelWrongStateError(
+            'closed')
+        result = self._publish(ch, message_id='m1')
+        self.assertEqual(result.status, PublishStatus.CHANNEL_FAILED)
+        conn._output_marshaled_frames.side_effect = None
+        # No lingering reservation: exactly one more publish fits.
+        self._publish(ch, message_id='m2')
+        self.assertEqual(len(ch._inflight_by_id), 1)
+        with self.assertRaises(InFlightPublishLimitError):
+            self._publish(ch, message_id='m3')
+
+    def test_connection_sweep_fails_every_channel(self):
+        ch, raw, conn, wrapper = self._armed()
+        results = [self._publish(ch, message_id=f'm{i}') for i in range(3)]
+        reason = StreamLostError('stream lost')
+        wrapper._channels = [ch]
+        # The wrapper here is a MagicMock, so drive the real method unbound.
+        Connection._fail_all_inflight_publishes(wrapper, reason)
+        for result in results:
+            self.assertEqual(result.status, PublishStatus.CHANNEL_FAILED)
+            self.assertIs(result.exception, reason)
+        self.assertEqual(ch._inflight_by_id, {})
+        self.assertEqual(ch._inflight_by_tag, {})
+
+    def test_sweep_is_idempotent_with_the_channel_close_hook(self):
+        ch, raw, conn, wrapper = self._armed()
+        result = self._publish(ch, message_id='m1')
+        reason = StreamLostError('stream lost')
+        # The channel-close hook and the connection sweep both fire on a
+        # connection loss; neither must raise and the status is recorded once.
+        self._close_channel(raw, reason)
+        Connection._fail_all_inflight_publishes(wrapper, reason)
+        self.assertEqual(result.status, PublishStatus.CHANNEL_FAILED)
+        self.assertEqual(ch._inflight_by_id, {})
+
+    def test_duplicate_id_after_completion_is_allowed(self):
+        ch, raw, conn, _wrapper = self._armed()
+        first = self._publish(ch, message_id='reuse')
+        self._inject_confirm(raw, conn, 1)
+        self.assertEqual(first.status, PublishStatus.ROUTED)
+        second = self._publish(ch, message_id='reuse')
+        self.assertIsNot(first, second)
+        self.assertEqual(list(ch._inflight_by_id), ['reuse'])
 
 
 if __name__ == '__main__':

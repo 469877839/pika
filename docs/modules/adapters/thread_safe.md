@@ -34,6 +34,46 @@ for i in range(5):
 conn.close()
 ```
 
+## Publishing with a routing result
+
+`basic_publish` is fire-and-forget. Publisher confirms tell you the broker took the message, but an unroutable `mandatory=True` message is answered with `Basic.Return` *and then* `Basic.Ack`, so an ack alone does not tell you it reached a queue.
+
+`Channel.publish_with_result` tracks one message through all three outcomes and reports a single terminal `PublishStatus`:
+
+| Status | Meaning |
+| -- | -- |
+| `ROUTED` | Acknowledged by the broker and not returned, so at least one queue matched. |
+| `NOT_ROUTED` | Returned via `Basic.Return`; no queue matched. The ack that follows does not change this. |
+| `NACKED` | Rejected by the broker in publisher-confirm mode. |
+| `CHANNEL_FAILED` | The channel or connection failed, or the frame could not be written, before an outcome arrived. |
+
+```python
+from pika.adapters.thread_safe_connection import PublishStatus
+
+result = ch.publish_with_result(
+    message_id='order-1234',        # unique while in flight
+    exchange='orders',
+    routing_key='new',
+    body=b'...',
+    mandatory=True,                 # required
+)
+
+result.wait(timeout=5)              # or pass on_result= to be called on the worker thread
+if result.status is PublishStatus.ROUTED:
+    ...                             # reached at least one queue
+elif result.status is PublishStatus.NOT_ROUTED:
+    ...                             # no queue bound; result.reply_code is spec.NO_ROUTE
+```
+
+- **`message_id` is your correlation key.** It is written into `properties.message_id`, because `Basic.Return` carries no delivery tag. Reusing an ID that is still in flight raises `ValueError`; `wait`ing does not withdraw the message, so an ID freed by a timeout is not free until its result actually arrives.
+- **Confirms are enabled automatically**, so `confirm_delivery` is not required and any listener it registered still receives every confirm.
+- **`mandatory=True` is enforced.** Without it an unroutable message is silently dropped and the ack would be indistinguishable from a routed one.
+- **`cancel_wait()` cancels only the caller's wait.** The message was already sent and stays tracked; the broker's eventual return, ack, nack or channel failure still produces a terminal result, and a later `wait()` can retrieve it. The same is true of a `wait(timeout=...)` that times out.
+- **Bound the in-flight set with `max_inflight_publishes`** on `Connection` (default `0`, no cap). Once the cap is reached, `publish_with_result` raises `pika.exceptions.InFlightPublishLimitError` *before writing any frame*, so a refused publish is never sent.
+- **Results survive failure.** A channel or connection close resolves every unresolved message as `CHANNEL_FAILED` (or `NOT_ROUTED` if it had already been returned), releasing its slot, so a blocked `wait` cannot outlive the connection.
+
+`basic_publish` and `confirm_delivery` are unchanged and remain usable on the same channel.
+
 ## Consumer threading model
 
 The `on_message_callback` registered with `basic_consume` is dispatched on a per-channel worker thread. This means:
@@ -115,5 +155,6 @@ conn = pika.Connection(
         - DEFAULT_RPC_TIMEOUT
         - DEFAULT_WORK_QUEUE_MAXSIZE
         - DEFAULT_WORK_QUEUE_PUT_TIMEOUT
+        - DEFAULT_MAX_INFLIGHT_PUBLISHES
       show_if_no_docstring: true
       show_root_heading: false

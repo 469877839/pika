@@ -74,6 +74,20 @@ The RabbitMQ Java and .NET clients run their confirm listener inline on the I/O 
 
 Idempotency also diverges from nothing: a second `confirm_delivery` on the same channel returns the cached `Confirm.SelectOk` without sending a frame or resetting the delivery-tag counter, which matches Java and .NET.
 
+## How `publish_with_result` combines return, confirm and failure
+
+`basic_publish` leaves routing as three uncorrelated signals: a `Basic.Return`, a `Basic.Ack`/`Basic.Nack`, and channel closure. `publish_with_result` joins them into one terminal `PublishStatus` per caller-supplied `message_id`.
+
+**Two indexes, one lock.** `_inflight_by_id` and `_inflight_by_tag` map the two identifiers the protocol gives a publish. A `Basic.Return` carries no delivery tag, so it is correlated through `BasicProperties.message_id`; an ack/nack carries only the delivery tag, so it is correlated through the tag assigned when the frame is written. `_publish_lock` guards both and is never held across user code. The tag is assigned inside the scheduled IOLoop function after `_publish_marshaled`, before the function returns, so a confirm processed later on the same thread always finds the tag mapped.
+
+**A return is recorded, not terminal.** The broker follows a mandatory return with the ack/nack for the same sequence number (see the NO_ROUTE measurement below). `_on_publish_return` therefore only stamps `record.returned`; the later ack resolves the record as `NOT_ROUTED` rather than `ROUTED`. A nack outranks a recorded return and resolves as `NACKED`, matching `BlockingChannel.basic_publish`, which raises `NackError` ahead of `UnroutableError`. This is the reason an ack after NO_ROUTE must never be reported as routing success.
+
+**One raw ack/nack listener, shared.** `pika.channel.Channel.confirm_delivery` replaces rather than adds a listener. The wrapper's single dispatcher calls `_note_confirm` first and only then forwards to the latest `confirm_delivery` user callback, so result tracking and a user listener coexist on one raw registration. A non-`frame.Method` argument (a mocked raw channel in tests) has no delivery tag and is skipped by the tracker but still forwarded.
+
+**Cancelling a wait does not withdraw the message.** `PublishResult.cancel_wait` and a `wait` timeout touch only the wait state; they leave both indexes populated. The broker's eventual confirm or a close still resolves the record, releases the slot, and fires `on_result`. A second `wait` after resolution returns the recorded status rather than re-raising the cancellation. The in-flight cap and the duplicate-ID guard are therefore judged against actual terminal resolution, not caller patience.
+
+**Three close paths converge on one sweep.** A raw channel's `_on_close_meta` dispatches the channel-close hook, which calls `_fail_all_inflight`; connection-level loss reaches the same method through `Connection._fail_all_inflight_publishes`, called from `_on_connection_closed`, the IOLoop-crash tail and `_record_forced_close`. Every call is idempotent per message (`_complete_locked` no-ops once `done`), so a record returned before the loss resolves as `NOT_ROUTED` and every other unresolved one as `CHANNEL_FAILED`. A write failure inside the scheduled publish calls `_fail_inflight` directly so the slot cannot be stranded when the channel was already gone.
+
 ## Measurements
 
 Every figure below names its configuration, because none of them reproduces without one. `utils/measure_close_loss.py` reproduces the close figures against a live broker, taking the message count, body size, work-queue size, callback cost, timeout and acknowledgement mode as arguments. It is not wired into CI: a run takes as long as the callbacks it times, and it reports counts rather than a verdict. It discriminates between versions, which is how to tell it is measuring the close and not the harness: at 400 messages of 8 KiB with `--timeout none` it reports 339 of 400 lost on 1.4.x behaviour and none once the close drains first.

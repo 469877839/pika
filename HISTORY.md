@@ -4,7 +4,7 @@ Notes for each release are also published on the [GitHub releases page](https://
 
 ## Upgrading to 1.5.0
 
-Eleven changes are worth reading before you upgrade. Three can turn a passing build red, two change what a working application observes when it cancels a consumer or closes a channel, one lets RabbitMQ close a channel sooner after a consumer timeout, one refuses messages larger than 64 MiB, one changes what the Twisted adapter reports when a connection closes, one changes the Python types that field-table numbers decode to, and one makes URL `ssl_options` verify the broker.
+Twelve changes are worth reading before you upgrade. Three can turn a passing build red, two change what a working application observes when it cancels a consumer or closes a channel, one adds a publish API that reports whether a message was routed, one lets RabbitMQ close a channel sooner after a consumer timeout, one refuses messages larger than 64 MiB, one changes what the Twisted adapter reports when a connection closes, one changes the Python types that field-table numbers decode to, and one makes URL `ssl_options` verify the broker.
 
 ### `pika.Connection` is new, and is the connection to use
 
@@ -13,6 +13,12 @@ Eleven changes are worth reading before you upgrade. Three can turn a passing bu
 `from pika.adapters.thread_safe_connection import Connection` also works, though the module moves in 2.0 (see #1681). `Channel` is not exported from `pika`, because channels come from `Connection.channel()`.
 
 If you are starting new code, use `pika.Connection`. If you have existing code on one of the adapters below, it keeps working in 1.5.0 and the deprecation notice tells you where it is going.
+
+### `Channel.publish_with_result` reports whether one message was routed
+
+A `Basic.Ack` does not prove a message reached a queue: an unroutable `mandatory=True` publish is answered with `Basic.Return` and then `Basic.Ack`. `Channel.publish_with_result(message_id, ...)` joins the mandatory return, the ack/nack and any channel failure into one terminal `PublishStatus` (`ROUTED`, `NOT_ROUTED`, `NACKED`, `CHANNEL_FAILED`) per caller-supplied `message_id`. It enables publisher confirms itself and requires `mandatory=True`, since a non-mandatory publish cannot be distinguished from a routed one.
+
+`message_id` is unique among the channel's in-flight result publishes and is written into `properties.message_id` for return correlation; reusing an in-flight ID raises `ValueError`. A new `max_inflight_publishes` connection parameter (default `0`, no cap) makes an over-limit publish raise `pika.exceptions.InFlightPublishLimitError` before any frame is written. `PublishResult.wait(timeout=...)` and `cancel_wait()` stop only the wait: the message was already sent and stays tracked until its result arrives. `basic_publish` and `confirm_delivery` are unchanged.
 
 ### The other adapters now emit a `DeprecationWarning`, which may fail your tests
 

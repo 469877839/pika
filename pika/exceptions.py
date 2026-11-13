@@ -434,6 +434,27 @@ class WorkQueueFullError(AMQPConnectionError):
     """
 
 
+class InFlightPublishLimitError(AMQPChannelError):
+    """
+    A result-producing publish was refused because the channel already held its configured maximum
+    number of in-flight published messages.
+
+    No frame was written for the refused message. Wait for another result to reach a terminal state,
+    raise ``max_inflight_publishes``, or pass ``0`` to disable the cap.
+    """
+
+
+class PublishWaitCancelled(Exception):
+    """
+    The caller cancelled its wait on an in-flight published message before a terminal result
+    arrived.
+
+    This is a local wait cancellation only: the publish frame has already been written to the
+    broker and stays in flight, so the broker's eventual return, ack, nack or a channel failure
+    still produces a terminal result for the message.
+    """
+
+
 class ShortStringTooLong(AMQPError):
 
     @override

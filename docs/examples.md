@@ -20,6 +20,7 @@ These examples cover each way of using Pika: `Connection`, which is thread-safe 
 - [Thread-safe consumer](examples/threaded_consumer.md)
 - [Thread-safe publisher](examples/threaded_publisher.md)
 - [Thread-safe publisher confirms](examples/publisher_confirms_threaded.md)
+- [Thread-safe publish with a routing result](examples/publish_with_result_threaded.md)
 - [Thread-safe long-running publisher](examples/long_running_publisher_threaded.md)
 - [Heartbeat and blocked-connection timeouts](examples/heartbeat_and_blocked_timeouts.md)
 - [Direct reply-to](examples/direct_reply_to.md)
